@@ -2806,33 +2806,32 @@ fn genDefers(
     }
 }
 
-fn checkUsed(gz: *GenZir, outer_scope: *Scope, inner_scope: *Scope) InnerError!void {
-    const astgen = gz.astgen;
-
+fn checkUsed(_: *GenZir, outer_scope: *Scope, inner_scope: *Scope) InnerError!void {
+    // const astgen = gz.astgen;
     var scope = inner_scope;
     while (scope != outer_scope) {
         switch (scope.tag) {
             .gen_zir => scope = scope.cast(GenZir).?.parent,
             .local_val => {
                 const s = scope.cast(Scope.LocalVal).?;
-                if (s.used == 0 and s.discarded == 0) {
-                    try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
-                } else if (s.used != 0 and s.discarded != 0) {
-                    try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
-                        try gz.astgen.errNoteTok(s.used, "used here", .{}),
-                    });
-                }
+                // if (s.used == 0 and s.discarded == 0) {
+                //     try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
+                // } else if (s.used != 0 and s.discarded != 0) {
+                //     try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
+                //         try gz.astgen.errNoteTok(s.used, "used here", .{}),
+                //     });
+                // }
                 scope = s.parent;
             },
             .local_ptr => {
                 const s = scope.cast(Scope.LocalPtr).?;
-                if (s.used == 0 and s.discarded == 0) {
-                    try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
-                } else if (s.used != 0 and s.discarded != 0) {
-                    try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
-                        try gz.astgen.errNoteTok(s.used, "used here", .{}),
-                    });
-                }
+                // if (s.used == 0 and s.discarded == 0) {
+                //     try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
+                // } else if (s.used != 0 and s.discarded != 0) {
+                //     try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
+                //         try gz.astgen.errNoteTok(s.used, "used here", .{}),
+                //     });
+                // }
                 scope = s.parent;
             },
             .defer_normal, .defer_error => scope = scope.cast(Scope.Defer).?.parent,
