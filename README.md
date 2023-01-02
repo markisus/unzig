@@ -1,3 +1,7 @@
+## Unzig  
+
+This is just a copy of Zig, with the unused variable error removed by this patch https://github.com/ziglang/zig/commit/499e27254538c0f1813962d33ecc253764031fdc  
+
 ![ZIG](https://ziglang.org/img/zig-logo-dynamic.svg)
 
 A general-purpose programming language and toolchain for maintaining
