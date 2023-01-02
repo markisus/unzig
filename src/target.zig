@@ -328,8 +328,8 @@ pub fn supportsStackProbing(target: std.Target) bool {
 }
 
 pub fn supportsStackProtector(target: std.Target) bool {
-    // TODO: investigate whether stack-protector works on wasm
-    return !target.isWasm();
+    _ = target;
+    return true;
 }
 
 pub fn libcProvidesStackProtector(target: std.Target) bool {
@@ -437,9 +437,6 @@ pub fn hasRedZone(target: std.Target) bool {
     return switch (target.cpu.arch) {
         .x86_64,
         .x86,
-        .powerpc,
-        .powerpc64,
-        .powerpc64le,
         .aarch64,
         .aarch64_be,
         .aarch64_32,
@@ -523,13 +520,13 @@ pub const AtomicPtrAlignmentDiagnostics = struct {
 /// If ABI alignment of `ty` is OK for atomic operations, returns 0.
 /// Otherwise returns the alignment required on a pointer for the target
 /// to perform atomic operations.
+// TODO this function does not take into account CPU features, which can affect
+// this value. Audit this!
 pub fn atomicPtrAlignment(
     target: std.Target,
     ty: Type,
     diags: *AtomicPtrAlignmentDiagnostics,
 ) AtomicPtrAlignmentError!u32 {
-    // TODO this was ported from stage1 but it does not take into account CPU features,
-    // which can affect this value. Audit this!
     const max_atomic_bits: u16 = switch (target.cpu.arch) {
         .avr,
         .msp430,
@@ -728,4 +725,44 @@ pub fn supportsTailCall(target: std.Target, backend: std.builtin.CompilerBackend
         .stage1, .stage2_llvm => return @import("codegen/llvm.zig").supportsTailCall(target),
         else => return false,
     }
+}
+
+pub fn libcFloatPrefix(float_bits: u16) []const u8 {
+    return switch (float_bits) {
+        16, 80 => "__",
+        32, 64, 128 => "",
+        else => unreachable,
+    };
+}
+
+pub fn libcFloatSuffix(float_bits: u16) []const u8 {
+    return switch (float_bits) {
+        16 => "h", // Non-standard
+        32 => "f",
+        64 => "",
+        80 => "x", // Non-standard
+        128 => "q", // Non-standard (mimics convention in GCC libquadmath)
+        else => unreachable,
+    };
+}
+
+pub fn compilerRtFloatAbbrev(float_bits: u16) []const u8 {
+    return switch (float_bits) {
+        16 => "h",
+        32 => "s",
+        64 => "d",
+        80 => "x",
+        128 => "t",
+        else => unreachable,
+    };
+}
+
+pub fn compilerRtIntAbbrev(bits: u16) []const u8 {
+    return switch (bits) {
+        16 => "h",
+        32 => "s",
+        64 => "d",
+        128 => "t",
+        else => "o", // Non-standard
+    };
 }

@@ -505,6 +505,7 @@ pub fn addStandaloneTests(
     enable_rosetta: bool,
     enable_wasmtime: bool,
     enable_wine: bool,
+    enable_symlinks_windows: bool,
 ) *build.Step {
     const cases = b.allocator.create(StandaloneContext) catch unreachable;
     cases.* = StandaloneContext{
@@ -522,6 +523,7 @@ pub fn addStandaloneTests(
         .enable_rosetta = enable_rosetta,
         .enable_wasmtime = enable_wasmtime,
         .enable_wine = enable_wine,
+        .enable_symlinks_windows = enable_symlinks_windows,
     };
 
     standalone.addCases(cases);
@@ -535,6 +537,7 @@ pub fn addLinkTests(
     modes: []const Mode,
     enable_macos_sdk: bool,
     omit_stage2: bool,
+    enable_symlinks_windows: bool,
 ) *build.Step {
     const cases = b.allocator.create(StandaloneContext) catch unreachable;
     cases.* = StandaloneContext{
@@ -547,6 +550,7 @@ pub fn addLinkTests(
         .enable_macos_sdk = enable_macos_sdk,
         .target = .{},
         .omit_stage2 = omit_stage2,
+        .enable_symlinks_windows = enable_symlinks_windows,
     };
     link.addCases(cases);
     return cases.step;
@@ -678,13 +682,6 @@ pub fn addPkgTests(
         } else false;
         if (!want_this_mode) continue;
 
-        if (test_target.backend) |backend| {
-            if (backend == .stage2_c and builtin.os.tag == .windows) {
-                // https://github.com/ziglang/zig/issues/12415
-                continue;
-            }
-        }
-
         const libc_prefix = if (test_target.target.getOs().requiresLibC())
             ""
         else if (test_target.link_libc)
@@ -716,20 +713,18 @@ pub fn addPkgTests(
         these_tests.addIncludePath("test");
         if (test_target.backend) |backend| switch (backend) {
             .stage1 => {
-                these_tests.use_stage1 = true;
+                @panic("stage1 testing requested");
             },
             .stage2_llvm => {
-                these_tests.use_stage1 = false;
                 these_tests.use_llvm = true;
             },
             .stage2_c => {
-                these_tests.use_stage1 = false;
                 these_tests.use_llvm = false;
             },
             else => {
-                these_tests.use_stage1 = false;
                 these_tests.use_llvm = false;
-                // TODO: force self-hosted linkers to avoid LLD creeping in until the auto-select mechanism deems them worthy
+                // TODO: force self-hosted linkers to avoid LLD creeping in
+                // until the auto-select mechanism deems them worthy
                 these_tests.use_lld = false;
             },
         };
@@ -988,7 +983,7 @@ pub const StackTracesContext = struct {
                     }
                     try buf.appendSlice("\n");
                 }
-                break :got_result buf.toOwnedSlice();
+                break :got_result try buf.toOwnedSlice();
             };
 
             if (!mem.eql(u8, self.expect_output, got)) {
@@ -1022,6 +1017,7 @@ pub const StandaloneContext = struct {
     enable_rosetta: bool = false,
     enable_wasmtime: bool = false,
     enable_wine: bool = false,
+    enable_symlinks_windows: bool,
 
     pub fn addC(self: *StandaloneContext, root_src: []const u8) void {
         self.addAllArgs(root_src, true);
@@ -1037,11 +1033,14 @@ pub const StandaloneContext = struct {
         requires_macos_sdk: bool = false,
         requires_stage2: bool = false,
         use_emulation: bool = false,
+        requires_symlinks: bool = false,
+        extra_argv: []const []const u8 = &.{},
     }) void {
         const b = self.b;
 
         if (features.requires_macos_sdk and !self.enable_macos_sdk) return;
         if (features.requires_stage2 and self.omit_stage2) return;
+        if (features.requires_symlinks and !self.enable_symlinks_windows and builtin.os.tag == .windows) return;
 
         const annotated_case_name = b.fmt("build {s}", .{build_file});
         if (self.test_filter) |filter| {
@@ -1055,6 +1054,8 @@ pub const StandaloneContext = struct {
 
         zig_args.append("--build-file") catch unreachable;
         zig_args.append(b.pathFromRoot(build_file)) catch unreachable;
+
+        zig_args.appendSlice(features.extra_argv) catch unreachable;
 
         zig_args.append("test") catch unreachable;
 
@@ -1344,8 +1345,6 @@ pub fn addCAbiTests(b: *build.Builder, skip_non_native: bool) *build.Step {
             "test-c-abi",
             triple_prefix,
         }));
-
-        test_step.use_stage1 = false;
 
         step.dependOn(&test_step.step);
     }

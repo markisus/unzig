@@ -1,3 +1,17 @@
+test "zig fmt: tuple struct" {
+    try testCanonical(
+        \\const T = struct {
+        \\    /// doc comment on tuple field
+        \\    comptime comptime u32,
+        \\    /// another doc comment on tuple field
+        \\    *u32 = 1,
+        \\    // needs to be wrapped in parentheses to not be parsed as a function decl
+        \\    (fn () void) align(1),
+        \\};
+        \\
+    );
+}
+
 test "zig fmt: preserves clobbers in inline asm with stray comma" {
     try testCanonical(
         \\fn foo() void {
@@ -90,29 +104,6 @@ test "zig fmt: rewrite callconv(.Inline) to the inline keyword" {
         \\inline fn foo() void {}
         \\const bar = .Inline;
         \\fn foo() callconv(bar) void {}
-        \\
-    );
-}
-
-// TODO Remove this after zig 0.10.0 is released.
-test "zig fmt: rewrite c_void to anyopaque" {
-    try testTransform(
-        \\const Foo = struct {
-        \\    c_void: *c_void,
-        \\};
-        \\
-        \\fn foo(a: ?*c_void) !*c_void {
-        \\    return a orelse unreachable;
-        \\}
-        \\
-    ,
-        \\const Foo = struct {
-        \\    c_void: *anyopaque,
-        \\};
-        \\
-        \\fn foo(a: ?*anyopaque) !*anyopaque {
-        \\    return a orelse unreachable;
-        \\}
         \\
     );
 }
@@ -225,6 +216,34 @@ test "zig fmt: top-level fields" {
     );
 }
 
+test "zig fmt: top-level tuple function call type" {
+    try testCanonical(
+        \\foo()
+        \\
+    );
+}
+
+test "zig fmt: top-level enum missing 'const name ='" {
+    try testError(
+        \\enum(u32)
+        \\
+    , &[_]Error{.expected_token});
+}
+
+test "zig fmt: top-level bare asterisk+identifier" {
+    try testCanonical(
+        \\*x
+        \\
+    );
+}
+
+test "zig fmt: top-level bare asterisk+asterisk+identifier" {
+    try testCanonical(
+        \\**x
+        \\
+    );
+}
+
 test "zig fmt: C style containers" {
     try testError(
         \\struct Foo {
@@ -262,14 +281,6 @@ test "zig fmt: decl between fields" {
         .decl_between_fields,
         .previous_field,
         .next_field,
-    });
-}
-
-test "zig fmt: eof after missing comma" {
-    try testError(
-        \\foo()
-    , &[_]Error{
-        .expected_comma_after_field,
     });
 }
 
@@ -4229,6 +4240,54 @@ test "zig fmt: remove newlines surrounding doc comment within container decl" {
     );
 }
 
+test "zig fmt: comptime before comptime field" {
+    try testError(
+        \\const Foo = struct {
+        \\    a: i32,
+        \\    comptime comptime b: i32 = 1234,
+        \\};
+        \\
+    , &[_]Error{
+        .expected_comma_after_field,
+    });
+}
+
+test "zig fmt: invalid else branch statement" {
+    try testError(
+        \\/// This is a doc comment for a comptime block.
+        \\comptime {}
+        \\/// This is a doc comment for a test
+        \\test "This is my test" {}
+    , &[_]Error{
+        .comptime_doc_comment,
+        .test_doc_comment,
+    });
+}
+
+test "zig fmt: invalid else branch statement" {
+    try testError(
+        \\comptime {
+        \\    if (true) {} else var a = 0;
+        \\    if (true) {} else defer {}
+        \\}
+        \\comptime {
+        \\    while (true) {} else var a = 0;
+        \\    while (true) {} else defer {}
+        \\}
+        \\comptime {
+        \\    for ("") |_| {} else var a = 0;
+        \\    for ("") |_| {} else defer {}
+        \\}
+    , &[_]Error{
+        .expected_statement,
+        .expected_statement,
+        .expected_statement,
+        .expected_statement,
+        .expected_statement,
+        .expected_statement,
+    });
+}
+
 test "zig fmt: anytype struct field" {
     try testError(
         \\pub const Pointer = struct {
@@ -5483,6 +5542,35 @@ test "zig fmt: canonicalize symbols (keywords)" {
     );
 }
 
+test "zig fmt: no space before newline before multiline string" {
+    try testCanonical(
+        \\const S = struct {
+        \\    text: []const u8,
+        \\    comment: []const u8,
+        \\};
+        \\
+        \\test {
+        \\    const s1 = .{
+        \\        .text =
+        \\        \\hello
+        \\        \\world
+        \\        ,
+        \\        .comment = "test",
+        \\    };
+        \\    _ = s1;
+        \\    const s2 = .{
+        \\        .comment = "test",
+        \\        .text =
+        \\        \\hello
+        \\        \\world
+        \\        ,
+        \\    };
+        \\    _ = s2;
+        \\}
+        \\
+    );
+}
+
 // Normalize \xNN and \u{NN} escapes and unicode inside @"" escapes.
 test "zig fmt: canonicalize symbols (character escapes)" {
     try testTransform(
@@ -5732,8 +5820,8 @@ test "recovery: missing semicolon" {
 test "recovery: invalid container members" {
     try testError(
         \\usingnamespace;
-        \\foo+
-        \\bar@,
+        \\@foo()+
+        \\@bar()@,
         \\while (a == 2) { test "" {}}
         \\test "" {
         \\    a & b
@@ -5741,7 +5829,7 @@ test "recovery: invalid container members" {
     , &[_]Error{
         .expected_expr,
         .expected_comma_after_field,
-        .expected_container_members,
+        .expected_type_expr,
         .expected_semi_after_stmt,
     });
 }
@@ -5820,7 +5908,7 @@ test "recovery: invalid comptime" {
     try testError(
         \\comptime
     , &[_]Error{
-        .expected_block_or_field,
+        .expected_type_expr,
     });
 }
 

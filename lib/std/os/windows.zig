@@ -134,6 +134,7 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
         .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
         .FILE_IS_A_DIRECTORY => return error.IsDir,
         .NOT_A_DIRECTORY => return error.NotDir,
+        .USER_MAPPED_FILE => return error.AccessDenied,
         .INVALID_HANDLE => unreachable,
         else => return unexpectedStatus(rc),
     }
@@ -801,7 +802,7 @@ pub fn ReadLink(dir: ?HANDLE, sub_path_w: []const u16, out_buffer: []u8) ReadLin
     }
     defer CloseHandle(result_handle);
 
-    var reparse_buf: [MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 = undefined;
+    var reparse_buf: [MAXIMUM_REPARSE_DATA_BUFFER_SIZE]u8 align(@alignOf(REPARSE_DATA_BUFFER)) = undefined;
     _ = DeviceIoControl(result_handle, FSCTL_GET_REPARSE_POINT, null, reparse_buf[0..]) catch |err| switch (err) {
         error.AccessDenied => unreachable,
         else => |e| return e,
@@ -1492,9 +1493,9 @@ pub fn VirtualFree(lpAddress: ?LPVOID, dwSize: usize, dwFreeType: DWORD) void {
     assert(kernel32.VirtualFree(lpAddress, dwSize, dwFreeType) != 0);
 }
 
-pub const VirtualQuerryError = error{Unexpected};
+pub const VirtualQueryError = error{Unexpected};
 
-pub fn VirtualQuery(lpAddress: ?LPVOID, lpBuffer: PMEMORY_BASIC_INFORMATION, dwLength: SIZE_T) VirtualQuerryError!SIZE_T {
+pub fn VirtualQuery(lpAddress: ?LPVOID, lpBuffer: PMEMORY_BASIC_INFORMATION, dwLength: SIZE_T) VirtualQueryError!SIZE_T {
     const rc = kernel32.VirtualQuery(lpAddress, lpBuffer, dwLength);
     if (rc == 0) {
         switch (kernel32.GetLastError()) {
@@ -1568,6 +1569,7 @@ pub const CreateProcessError = error{
     AccessDenied,
     InvalidName,
     NameTooLong,
+    InvalidExe,
     Unexpected,
 };
 
@@ -1602,6 +1604,30 @@ pub fn CreateProcessW(
             .INVALID_PARAMETER => unreachable,
             .INVALID_NAME => return error.InvalidName,
             .FILENAME_EXCED_RANGE => return error.NameTooLong,
+            // These are all the system errors that are mapped to ENOEXEC by
+            // the undocumented _dosmaperr (old CRT) or __acrt_errno_map_os_error
+            // (newer CRT) functions. Their code can be found in crt/src/dosmap.c (old SDK)
+            // or urt/misc/errno.cpp (newer SDK) in the Windows SDK.
+            .BAD_FORMAT,
+            .INVALID_STARTING_CODESEG, // MIN_EXEC_ERROR in errno.cpp
+            .INVALID_STACKSEG,
+            .INVALID_MODULETYPE,
+            .INVALID_EXE_SIGNATURE,
+            .EXE_MARKED_INVALID,
+            .BAD_EXE_FORMAT,
+            .ITERATED_DATA_EXCEEDS_64k,
+            .INVALID_MINALLOCSIZE,
+            .DYNLINK_FROM_INVALID_RING,
+            .IOPL_NOT_ENABLED,
+            .INVALID_SEGDPL,
+            .AUTODATASEG_EXCEEDS_64k,
+            .RING2SEG_MUST_BE_MOVABLE,
+            .RELOC_CHAIN_XEEDS_SEGLIM,
+            .INFLOOP_IN_RELOC_CHAIN, // MAX_EXEC_ERROR in errno.cpp
+            // This one is not mapped to ENOEXEC but it is possible, for example
+            // when calling CreateProcessW on a plain text file with a .exe extension
+            .EXE_MACHINE_TYPE_MISMATCH,
+            => return error.InvalidExe,
             else => |err| return unexpectedError(err),
         }
     }
@@ -1801,6 +1827,23 @@ pub fn nanoSecondsToFileTime(ns: i128) FILETIME {
     };
 }
 
+/// Compares two WTF16 strings using RtlEqualUnicodeString
+pub fn eqlIgnoreCaseWTF16(a: []const u16, b: []const u16) bool {
+    const a_bytes = @intCast(u16, a.len * 2);
+    const a_string = UNICODE_STRING{
+        .Length = a_bytes,
+        .MaximumLength = a_bytes,
+        .Buffer = @intToPtr([*]u16, @ptrToInt(a.ptr)),
+    };
+    const b_bytes = @intCast(u16, b.len * 2);
+    const b_string = UNICODE_STRING{
+        .Length = b_bytes,
+        .MaximumLength = b_bytes,
+        .Buffer = @intToPtr([*]u16, @ptrToInt(b.ptr)),
+    };
+    return ntdll.RtlEqualUnicodeString(&a_string, &b_string, TRUE) == TRUE;
+}
+
 pub const PathSpace = struct {
     data: [PATH_MAX_WIDE:0]u16,
     len: usize,
@@ -1982,7 +2025,7 @@ pub fn loadWinsockExtensionFunction(comptime T: type, sock: ws2_32.SOCKET, guid:
         ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER,
         @ptrCast(*const anyopaque, &guid),
         @sizeOf(GUID),
-        &function,
+        @intToPtr(?*anyopaque, @ptrToInt(function)),
         @sizeOf(T),
         &num_bytes,
         null,
@@ -2088,6 +2131,7 @@ pub const LPWSTR = [*:0]WCHAR;
 pub const LPCWSTR = [*:0]const WCHAR;
 pub const PVOID = *anyopaque;
 pub const PWSTR = [*:0]WCHAR;
+pub const PCWSTR = [*:0]const WCHAR;
 pub const SIZE_T = usize;
 pub const UINT = c_uint;
 pub const ULONG_PTR = usize;
@@ -2103,6 +2147,7 @@ pub const USHORT = u16;
 pub const SHORT = i16;
 pub const ULONG = u32;
 pub const LONG = i32;
+pub const ULONG64 = u64;
 pub const ULONGLONG = u64;
 pub const LONGLONG = i64;
 pub const HLOCAL = HANDLE;
@@ -2503,6 +2548,7 @@ pub const STANDARD_RIGHTS_READ = READ_CONTROL;
 pub const STANDARD_RIGHTS_WRITE = READ_CONTROL;
 pub const STANDARD_RIGHTS_EXECUTE = READ_CONTROL;
 pub const STANDARD_RIGHTS_REQUIRED = DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
+pub const MAXIMUM_ALLOWED = 0x02000000;
 
 // disposition for NtCreateFile
 pub const FILE_SUPERSEDE = 0;
@@ -2692,7 +2738,7 @@ pub const MEM_RESERVE_PLACEHOLDERS = 0x2;
 pub const MEM_DECOMMIT = 0x4000;
 pub const MEM_RELEASE = 0x8000;
 
-pub const PTHREAD_START_ROUTINE = std.meta.FnPtr(fn (LPVOID) callconv(.C) DWORD);
+pub const PTHREAD_START_ROUTINE = *const fn (LPVOID) callconv(.C) DWORD;
 pub const LPTHREAD_START_ROUTINE = PTHREAD_START_ROUTINE;
 
 pub const WIN32_FIND_DATAW = extern struct {
@@ -2865,14 +2911,148 @@ pub const IMAGE_TLS_DIRECTORY = extern struct {
 pub const IMAGE_TLS_DIRECTORY64 = IMAGE_TLS_DIRECTORY;
 pub const IMAGE_TLS_DIRECTORY32 = IMAGE_TLS_DIRECTORY;
 
-pub const PIMAGE_TLS_CALLBACK = ?std.meta.FnPtr(fn (PVOID, DWORD, PVOID) callconv(.C) void);
+pub const PIMAGE_TLS_CALLBACK = ?*const fn (PVOID, DWORD, PVOID) callconv(.C) void;
 
 pub const PROV_RSA_FULL = 1;
 
 pub const REGSAM = ACCESS_MASK;
 pub const ACCESS_MASK = DWORD;
-pub const HKEY = *opaque {};
 pub const LSTATUS = LONG;
+
+pub const HKEY = *opaque {};
+
+pub const HKEY_LOCAL_MACHINE: HKEY = @intToPtr(HKEY, 0x80000002);
+
+/// Combines the STANDARD_RIGHTS_REQUIRED, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_CREATE_SUB_KEY,
+/// KEY_ENUMERATE_SUB_KEYS, KEY_NOTIFY, and KEY_CREATE_LINK access rights.
+pub const KEY_ALL_ACCESS = 0xF003F;
+/// Reserved for system use.
+pub const KEY_CREATE_LINK = 0x0020;
+/// Required to create a subkey of a registry key.
+pub const KEY_CREATE_SUB_KEY = 0x0004;
+/// Required to enumerate the subkeys of a registry key.
+pub const KEY_ENUMERATE_SUB_KEYS = 0x0008;
+/// Equivalent to KEY_READ.
+pub const KEY_EXECUTE = 0x20019;
+/// Required to request change notifications for a registry key or for subkeys of a registry key.
+pub const KEY_NOTIFY = 0x0010;
+/// Required to query the values of a registry key.
+pub const KEY_QUERY_VALUE = 0x0001;
+/// Combines the STANDARD_RIGHTS_READ, KEY_QUERY_VALUE, KEY_ENUMERATE_SUB_KEYS, and KEY_NOTIFY values.
+pub const KEY_READ = 0x20019;
+/// Required to create, delete, or set a registry value.
+pub const KEY_SET_VALUE = 0x0002;
+/// Indicates that an application on 64-bit Windows should operate on the 32-bit registry view.
+/// This flag is ignored by 32-bit Windows.
+pub const KEY_WOW64_32KEY = 0x0200;
+/// Indicates that an application on 64-bit Windows should operate on the 64-bit registry view.
+/// This flag is ignored by 32-bit Windows.
+pub const KEY_WOW64_64KEY = 0x0100;
+/// Combines the STANDARD_RIGHTS_WRITE, KEY_SET_VALUE, and KEY_CREATE_SUB_KEY access rights.
+pub const KEY_WRITE = 0x20006;
+
+/// Open symbolic link.
+pub const REG_OPTION_OPEN_LINK: DWORD = 0x8;
+
+pub const RTL_QUERY_REGISTRY_TABLE = extern struct {
+    QueryRoutine: RTL_QUERY_REGISTRY_ROUTINE,
+    Flags: ULONG,
+    Name: ?PWSTR,
+    EntryContext: ?*anyopaque,
+    DefaultType: ULONG,
+    DefaultData: ?*anyopaque,
+    DefaultLength: ULONG,
+};
+
+pub const RTL_QUERY_REGISTRY_ROUTINE = ?*const fn (
+    PWSTR,
+    ULONG,
+    ?*anyopaque,
+    ULONG,
+    ?*anyopaque,
+    ?*anyopaque,
+) callconv(WINAPI) NTSTATUS;
+
+/// Path is a full path
+pub const RTL_REGISTRY_ABSOLUTE = 0;
+/// \Registry\Machine\System\CurrentControlSet\Services
+pub const RTL_REGISTRY_SERVICES = 1;
+/// \Registry\Machine\System\CurrentControlSet\Control
+pub const RTL_REGISTRY_CONTROL = 2;
+/// \Registry\Machine\Software\Microsoft\Windows NT\CurrentVersion
+pub const RTL_REGISTRY_WINDOWS_NT = 3;
+/// \Registry\Machine\Hardware\DeviceMap
+pub const RTL_REGISTRY_DEVICEMAP = 4;
+/// \Registry\User\CurrentUser
+pub const RTL_REGISTRY_USER = 5;
+pub const RTL_REGISTRY_MAXIMUM = 6;
+
+/// Low order bits are registry handle
+pub const RTL_REGISTRY_HANDLE = 0x40000000;
+/// Indicates the key node is optional
+pub const RTL_REGISTRY_OPTIONAL = 0x80000000;
+
+/// Name is a subkey and remainder of table or until next subkey are value
+/// names for that subkey to look at.
+pub const RTL_QUERY_REGISTRY_SUBKEY = 0x00000001;
+
+/// Reset current key to original key for this and all following table entries.
+pub const RTL_QUERY_REGISTRY_TOPKEY = 0x00000002;
+
+/// Fail if no match found for this table entry.
+pub const RTL_QUERY_REGISTRY_REQUIRED = 0x00000004;
+
+/// Used to mark a table entry that has no value name, just wants a call out, not
+/// an enumeration of all values.
+pub const RTL_QUERY_REGISTRY_NOVALUE = 0x00000008;
+
+/// Used to suppress the expansion of REG_MULTI_SZ into multiple callouts or
+/// to prevent the expansion of environment variable values in REG_EXPAND_SZ.
+pub const RTL_QUERY_REGISTRY_NOEXPAND = 0x00000010;
+
+/// QueryRoutine field ignored.  EntryContext field points to location to store value.
+/// For null terminated strings, EntryContext points to UNICODE_STRING structure that
+/// that describes maximum size of buffer. If .Buffer field is NULL then a buffer is
+/// allocated.
+pub const RTL_QUERY_REGISTRY_DIRECT = 0x00000020;
+
+/// Used to delete value keys after they are queried.
+pub const RTL_QUERY_REGISTRY_DELETE = 0x00000040;
+
+/// Use this flag with the RTL_QUERY_REGISTRY_DIRECT flag to verify that the REG_XXX type
+/// of the stored registry value matches the type expected by the caller.
+/// If the types do not match, the call fails.
+pub const RTL_QUERY_REGISTRY_TYPECHECK = 0x00000100;
+
+pub const REG = struct {
+    /// No value type
+    pub const NONE: ULONG = 0;
+    /// Unicode nul terminated string
+    pub const SZ: ULONG = 1;
+    /// Unicode nul terminated string (with environment variable references)
+    pub const EXPAND_SZ: ULONG = 2;
+    /// Free form binary
+    pub const BINARY: ULONG = 3;
+    /// 32-bit number
+    pub const DWORD: ULONG = 4;
+    /// 32-bit number (same as REG_DWORD)
+    pub const DWORD_LITTLE_ENDIAN: ULONG = 4;
+    /// 32-bit number
+    pub const DWORD_BIG_ENDIAN: ULONG = 5;
+    /// Symbolic Link (unicode)
+    pub const LINK: ULONG = 6;
+    /// Multiple Unicode strings
+    pub const MULTI_SZ: ULONG = 7;
+    /// Resource list in the resource map
+    pub const RESOURCE_LIST: ULONG = 8;
+    /// Resource list in the hardware description
+    pub const FULL_RESOURCE_DESCRIPTOR: ULONG = 9;
+    pub const RESOURCE_REQUIREMENTS_LIST: ULONG = 10;
+    /// 64-bit number
+    pub const QWORD: ULONG = 11;
+    /// 64-bit number (same as REG_QWORD)
+    pub const QWORD_LITTLE_ENDIAN: ULONG = 11;
+};
 
 pub const FILE_NOTIFY_INFORMATION = extern struct {
     NextEntryOffset: DWORD,
@@ -2888,7 +3068,7 @@ pub const FILE_ACTION_MODIFIED = 0x00000003;
 pub const FILE_ACTION_RENAMED_OLD_NAME = 0x00000004;
 pub const FILE_ACTION_RENAMED_NEW_NAME = 0x00000005;
 
-pub const LPOVERLAPPED_COMPLETION_ROUTINE = ?std.meta.FnPtr(fn (DWORD, DWORD, *OVERLAPPED) callconv(.C) void);
+pub const LPOVERLAPPED_COMPLETION_ROUTINE = ?*const fn (DWORD, DWORD, *OVERLAPPED) callconv(.C) void;
 
 pub const FILE_NOTIFY_CHANGE_CREATION = 64;
 pub const FILE_NOTIFY_CHANGE_SIZE = 8;
@@ -2941,7 +3121,7 @@ pub const RTL_CRITICAL_SECTION = extern struct {
 pub const CRITICAL_SECTION = RTL_CRITICAL_SECTION;
 pub const INIT_ONCE = RTL_RUN_ONCE;
 pub const INIT_ONCE_STATIC_INIT = RTL_RUN_ONCE_INIT;
-pub const INIT_ONCE_FN = std.meta.FnPtr(fn (InitOnce: *INIT_ONCE, Parameter: ?*anyopaque, Context: ?*anyopaque) callconv(.C) BOOL);
+pub const INIT_ONCE_FN = *const fn (InitOnce: *INIT_ONCE, Parameter: ?*anyopaque, Context: ?*anyopaque) callconv(.C) BOOL;
 
 pub const RTL_RUN_ONCE = extern struct {
     Ptr: ?*anyopaque,
@@ -3244,7 +3424,7 @@ pub const EXCEPTION_POINTERS = extern struct {
     ContextRecord: *std.os.windows.CONTEXT,
 };
 
-pub const VECTORED_EXCEPTION_HANDLER = std.meta.FnPtr(fn (ExceptionInfo: *EXCEPTION_POINTERS) callconv(WINAPI) c_long);
+pub const VECTORED_EXCEPTION_HANDLER = *const fn (ExceptionInfo: *EXCEPTION_POINTERS) callconv(WINAPI) c_long;
 
 pub const OBJECT_ATTRIBUTES = extern struct {
     Length: ULONG,
@@ -3520,7 +3700,21 @@ pub const RTL_DRIVE_LETTER_CURDIR = extern struct {
     DosPath: UNICODE_STRING,
 };
 
-pub const PPS_POST_PROCESS_INIT_ROUTINE = ?std.meta.FnPtr(fn () callconv(.C) void);
+pub const PPS_POST_PROCESS_INIT_ROUTINE = ?*const fn () callconv(.C) void;
+
+pub const FILE_DIRECTORY_INFORMATION = extern struct {
+    NextEntryOffset: ULONG,
+    FileIndex: ULONG,
+    CreationTime: LARGE_INTEGER,
+    LastAccessTime: LARGE_INTEGER,
+    LastWriteTime: LARGE_INTEGER,
+    ChangeTime: LARGE_INTEGER,
+    EndOfFile: LARGE_INTEGER,
+    AllocationSize: LARGE_INTEGER,
+    FileAttributes: ULONG,
+    FileNameLength: ULONG,
+    FileName: [1]WCHAR,
+};
 
 pub const FILE_BOTH_DIR_INFORMATION = extern struct {
     NextEntryOffset: ULONG,
@@ -3540,7 +3734,7 @@ pub const FILE_BOTH_DIR_INFORMATION = extern struct {
 };
 pub const FILE_BOTH_DIRECTORY_INFORMATION = FILE_BOTH_DIR_INFORMATION;
 
-pub const IO_APC_ROUTINE = std.meta.FnPtr(fn (PVOID, *IO_STATUS_BLOCK, ULONG) callconv(.C) void);
+pub const IO_APC_ROUTINE = *const fn (PVOID, *IO_STATUS_BLOCK, ULONG) callconv(.C) void;
 
 pub const CURDIR = extern struct {
     DosPath: UNICODE_STRING,
@@ -3612,8 +3806,8 @@ pub const ENUM_PAGE_FILE_INFORMATION = extern struct {
     PeakUsage: SIZE_T,
 };
 
-pub const PENUM_PAGE_FILE_CALLBACKW = ?std.meta.FnPtr(fn (?LPVOID, *ENUM_PAGE_FILE_INFORMATION, LPCWSTR) callconv(.C) BOOL);
-pub const PENUM_PAGE_FILE_CALLBACKA = ?std.meta.FnPtr(fn (?LPVOID, *ENUM_PAGE_FILE_INFORMATION, LPCSTR) callconv(.C) BOOL);
+pub const PENUM_PAGE_FILE_CALLBACKW = ?*const fn (?LPVOID, *ENUM_PAGE_FILE_INFORMATION, LPCWSTR) callconv(.C) BOOL;
+pub const PENUM_PAGE_FILE_CALLBACKA = ?*const fn (?LPVOID, *ENUM_PAGE_FILE_INFORMATION, LPCSTR) callconv(.C) BOOL;
 
 pub const PSAPI_WS_WATCH_INFORMATION_EX = extern struct {
     BasicInfo: PSAPI_WS_WATCH_INFORMATION,
@@ -3713,4 +3907,306 @@ pub const CTRL_CLOSE_EVENT: DWORD = 2;
 pub const CTRL_LOGOFF_EVENT: DWORD = 5;
 pub const CTRL_SHUTDOWN_EVENT: DWORD = 6;
 
-pub const HANDLER_ROUTINE = std.meta.FnPtr(fn (dwCtrlType: DWORD) callconv(WINAPI) BOOL);
+pub const HANDLER_ROUTINE = *const fn (dwCtrlType: DWORD) callconv(WINAPI) BOOL;
+
+/// Processor feature enumeration.
+pub const PF = enum(DWORD) {
+    /// On a Pentium, a floating-point precision error can occur in rare circumstances.
+    FLOATING_POINT_PRECISION_ERRATA = 0,
+
+    /// Floating-point operations are emulated using software emulator.
+    /// This function returns a nonzero value if floating-point operations are emulated; otherwise, it returns zero.
+    FLOATING_POINT_EMULATED = 1,
+
+    /// The atomic compare and exchange operation (cmpxchg) is available.
+    COMPARE_EXCHANGE_DOUBLE = 2,
+
+    /// The MMX instruction set is available.
+    MMX_INSTRUCTIONS_AVAILABLE = 3,
+
+    PPC_MOVEMEM_64BIT_OK = 4,
+    ALPHA_BYTE_INSTRUCTIONS = 5,
+
+    /// The SSE instruction set is available.
+    XMMI_INSTRUCTIONS_AVAILABLE = 6,
+
+    /// The 3D-Now instruction is available.
+    @"3DNOW_INSTRUCTIONS_AVAILABLE" = 7,
+
+    /// The RDTSC instruction is available.
+    RDTSC_INSTRUCTION_AVAILABLE = 8,
+
+    /// The processor is PAE-enabled.
+    PAE_ENABLED = 9,
+
+    /// The SSE2 instruction set is available.
+    XMMI64_INSTRUCTIONS_AVAILABLE = 10,
+
+    SSE_DAZ_MODE_AVAILABLE = 11,
+
+    /// Data execution prevention is enabled.
+    NX_ENABLED = 12,
+
+    /// The SSE3 instruction set is available.
+    SSE3_INSTRUCTIONS_AVAILABLE = 13,
+
+    /// The atomic compare and exchange 128-bit operation (cmpxchg16b) is available.
+    COMPARE_EXCHANGE128 = 14,
+
+    /// The atomic compare 64 and exchange 128-bit operation (cmp8xchg16) is available.
+    COMPARE64_EXCHANGE128 = 15,
+
+    /// The processor channels are enabled.
+    CHANNELS_ENABLED = 16,
+
+    /// The processor implements the XSAVI and XRSTOR instructions.
+    XSAVE_ENABLED = 17,
+
+    /// The VFP/Neon: 32 x 64bit register bank is present.
+    /// This flag has the same meaning as PF_ARM_VFP_EXTENDED_REGISTERS.
+    ARM_VFP_32_REGISTERS_AVAILABLE = 18,
+
+    /// This ARM processor implements the ARM v8 NEON instruction set.
+    ARM_NEON_INSTRUCTIONS_AVAILABLE = 19,
+
+    /// Second Level Address Translation is supported by the hardware.
+    SECOND_LEVEL_ADDRESS_TRANSLATION = 20,
+
+    /// Virtualization is enabled in the firmware and made available by the operating system.
+    VIRT_FIRMWARE_ENABLED = 21,
+
+    /// RDFSBASE, RDGSBASE, WRFSBASE, and WRGSBASE instructions are available.
+    RDWRFSGBASE_AVAILABLE = 22,
+
+    /// _fastfail() is available.
+    FASTFAIL_AVAILABLE = 23,
+
+    /// The divide instruction_available.
+    ARM_DIVIDE_INSTRUCTION_AVAILABLE = 24,
+
+    /// The 64-bit load/store atomic instructions are available.
+    ARM_64BIT_LOADSTORE_ATOMIC = 25,
+
+    /// The external cache is available.
+    ARM_EXTERNAL_CACHE_AVAILABLE = 26,
+
+    /// The floating-point multiply-accumulate instruction is available.
+    ARM_FMAC_INSTRUCTIONS_AVAILABLE = 27,
+
+    RDRAND_INSTRUCTION_AVAILABLE = 28,
+
+    /// This ARM processor implements the ARM v8 instructions set.
+    ARM_V8_INSTRUCTIONS_AVAILABLE = 29,
+
+    /// This ARM processor implements the ARM v8 extra cryptographic instructions (i.e., AES, SHA1 and SHA2).
+    ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE = 30,
+
+    /// This ARM processor implements the ARM v8 extra CRC32 instructions.
+    ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE = 31,
+
+    RDTSCP_INSTRUCTION_AVAILABLE = 32,
+    RDPID_INSTRUCTION_AVAILABLE = 33,
+
+    /// This ARM processor implements the ARM v8.1 atomic instructions (e.g., CAS, SWP).
+    ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE = 34,
+
+    MONITORX_INSTRUCTION_AVAILABLE = 35,
+
+    /// The SSSE3 instruction set is available.
+    SSSE3_INSTRUCTIONS_AVAILABLE = 36,
+
+    /// The SSE4_1 instruction set is available.
+    SSE4_1_INSTRUCTIONS_AVAILABLE = 37,
+
+    /// The SSE4_2 instruction set is available.
+    SSE4_2_INSTRUCTIONS_AVAILABLE = 38,
+
+    /// The AVX instruction set is available.
+    AVX_INSTRUCTIONS_AVAILABLE = 39,
+
+    /// The AVX2 instruction set is available.
+    AVX2_INSTRUCTIONS_AVAILABLE = 40,
+
+    /// The AVX512F instruction set is available.
+    AVX512F_INSTRUCTIONS_AVAILABLE = 41,
+
+    ERMS_AVAILABLE = 42,
+
+    /// This ARM processor implements the ARM v8.2 Dot Product (DP) instructions.
+    ARM_V82_DP_INSTRUCTIONS_AVAILABLE = 43,
+
+    /// This ARM processor implements the ARM v8.3 JavaScript conversion (JSCVT) instructions.
+    ARM_V83_JSCVT_INSTRUCTIONS_AVAILABLE = 44,
+};
+
+pub const MAX_WOW64_SHARED_ENTRIES = 16;
+pub const PROCESSOR_FEATURE_MAX = 64;
+pub const MAXIMUM_XSTATE_FEATURES = 64;
+
+pub const KSYSTEM_TIME = extern struct {
+    LowPart: ULONG,
+    High1Time: LONG,
+    High2Time: LONG,
+};
+
+pub const NT_PRODUCT_TYPE = enum(INT) {
+    NtProductWinNt = 1,
+    NtProductLanManNt,
+    NtProductServer,
+};
+
+pub const ALTERNATIVE_ARCHITECTURE_TYPE = enum(INT) {
+    StandardDesign,
+    NEC98x86,
+    EndAlternatives,
+};
+
+pub const XSTATE_FEATURE = extern struct {
+    Offset: ULONG,
+    Size: ULONG,
+};
+
+pub const XSTATE_CONFIGURATION = extern struct {
+    EnabledFeatures: ULONG64,
+    Size: ULONG,
+    OptimizedSave: ULONG,
+    Features: [MAXIMUM_XSTATE_FEATURES]XSTATE_FEATURE,
+};
+
+/// Shared Kernel User Data
+pub const KUSER_SHARED_DATA = extern struct {
+    TickCountLowDeprecated: ULONG,
+    TickCountMultiplier: ULONG,
+    InterruptTime: KSYSTEM_TIME,
+    SystemTime: KSYSTEM_TIME,
+    TimeZoneBias: KSYSTEM_TIME,
+    ImageNumberLow: USHORT,
+    ImageNumberHigh: USHORT,
+    NtSystemRoot: [260]WCHAR,
+    MaxStackTraceDepth: ULONG,
+    CryptoExponent: ULONG,
+    TimeZoneId: ULONG,
+    LargePageMinimum: ULONG,
+    AitSamplingValue: ULONG,
+    AppCompatFlag: ULONG,
+    RNGSeedVersion: ULONGLONG,
+    GlobalValidationRunlevel: ULONG,
+    TimeZoneBiasStamp: LONG,
+    NtBuildNumber: ULONG,
+    NtProductType: NT_PRODUCT_TYPE,
+    ProductTypeIsValid: BOOLEAN,
+    Reserved0: [1]BOOLEAN,
+    NativeProcessorArchitecture: USHORT,
+    NtMajorVersion: ULONG,
+    NtMinorVersion: ULONG,
+    ProcessorFeatures: [PROCESSOR_FEATURE_MAX]BOOLEAN,
+    Reserved1: ULONG,
+    Reserved3: ULONG,
+    TimeSlip: ULONG,
+    AlternativeArchitecture: ALTERNATIVE_ARCHITECTURE_TYPE,
+    BootId: ULONG,
+    SystemExpirationDate: LARGE_INTEGER,
+    SuiteMaskY: ULONG,
+    KdDebuggerEnabled: BOOLEAN,
+    DummyUnion1: extern union {
+        MitigationPolicies: UCHAR,
+        Alt: packed struct {
+            NXSupportPolicy: u2,
+            SEHValidationPolicy: u2,
+            CurDirDevicesSkippedForDlls: u2,
+            Reserved: u2,
+        },
+    },
+    CyclesPerYield: USHORT,
+    ActiveConsoleId: ULONG,
+    DismountCount: ULONG,
+    ComPlusPackage: ULONG,
+    LastSystemRITEventTickCount: ULONG,
+    NumberOfPhysicalPages: ULONG,
+    SafeBootMode: BOOLEAN,
+    DummyUnion2: extern union {
+        VirtualizationFlags: UCHAR,
+        Alt: packed struct {
+            ArchStartedInEl2: u1,
+            QcSlIsSupported: u1,
+            SpareBits: u6,
+        },
+    },
+    Reserved12: [2]UCHAR,
+    DummyUnion3: extern union {
+        SharedDataFlags: ULONG,
+        Alt: packed struct {
+            DbgErrorPortPresent: u1,
+            DbgElevationEnabled: u1,
+            DbgVirtEnabled: u1,
+            DbgInstallerDetectEnabled: u1,
+            DbgLkgEnabled: u1,
+            DbgDynProcessorEnabled: u1,
+            DbgConsoleBrokerEnabled: u1,
+            DbgSecureBootEnabled: u1,
+            DbgMultiSessionSku: u1,
+            DbgMultiUsersInSessionSku: u1,
+            DbgStateSeparationEnabled: u1,
+            SpareBits: u21,
+        },
+    },
+    DataFlagsPad: [1]ULONG,
+    TestRetInstruction: ULONGLONG,
+    QpcFrequency: LONGLONG,
+    SystemCall: ULONG,
+    Reserved2: ULONG,
+    SystemCallPad: [2]ULONGLONG,
+    DummyUnion4: extern union {
+        TickCount: KSYSTEM_TIME,
+        TickCountQuad: ULONG64,
+        Alt: extern struct {
+            ReservedTickCountOverlay: [3]ULONG,
+            TickCountPad: [1]ULONG,
+        },
+    },
+    Cookie: ULONG,
+    CookiePad: [1]ULONG,
+    ConsoleSessionForegroundProcessId: LONGLONG,
+    TimeUpdateLock: ULONGLONG,
+    BaselineSystemTimeQpc: ULONGLONG,
+    BaselineInterruptTimeQpc: ULONGLONG,
+    QpcSystemTimeIncrement: ULONGLONG,
+    QpcInterruptTimeIncrement: ULONGLONG,
+    QpcSystemTimeIncrementShift: UCHAR,
+    QpcInterruptTimeIncrementShift: UCHAR,
+    UnparkedProcessorCount: USHORT,
+    EnclaveFeatureMask: [4]ULONG,
+    TelemetryCoverageRound: ULONG,
+    UserModeGlobalLogger: [16]USHORT,
+    ImageFileExecutionOptions: ULONG,
+    LangGenerationCount: ULONG,
+    Reserved4: ULONGLONG,
+    InterruptTimeBias: ULONGLONG,
+    QpcBias: ULONGLONG,
+    ActiveProcessorCount: ULONG,
+    ActiveGroupCount: UCHAR,
+    Reserved9: UCHAR,
+    DummyUnion5: extern union {
+        QpcData: USHORT,
+        Alt: extern struct {
+            QpcBypassEnabled: UCHAR,
+            QpcShift: UCHAR,
+        },
+    },
+    TimeZoneBiasEffectiveStart: LARGE_INTEGER,
+    TimeZoneBiasEffectiveEnd: LARGE_INTEGER,
+    XState: XSTATE_CONFIGURATION,
+    FeatureConfigurationChangeStamp: KSYSTEM_TIME,
+    Spare: ULONG,
+    UserPointerAuthMask: ULONG64,
+};
+
+/// Read-only user-mode address for the shared data.
+/// https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntexapi_x/kuser_shared_data/index.htm
+/// https://msrc-blog.microsoft.com/2022/04/05/randomizing-the-kuser_shared_data-structure-on-windows/
+pub const SharedUserData: *const KUSER_SHARED_DATA = @intToPtr(*const KUSER_SHARED_DATA, 0x7FFE0000);
+
+pub fn IsProcessorFeaturePresent(feature: PF) bool {
+    if (@enumToInt(feature) >= PROCESSOR_FEATURE_MAX) return false;
+    return SharedUserData.ProcessorFeatures[@enumToInt(feature)] == 1;
+}

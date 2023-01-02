@@ -4,38 +4,57 @@ on:
   push:
     branches: 
       - master
+concurrency: 
+  # Cancels pending runs when a PR gets updated.
+  group: ${{ github.head_ref || github.run_id }}-${{ github.actor }}
+  cancel-in-progress: true
 jobs:
   x86_64-linux-debug:
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     runs-on: [self-hosted, Linux, x86_64]
     steps:
       - name: Checkout
         uses: actions/checkout@v3
       - name: Build and Test
-        run: sh ./ci/linux/build-x86_64-debug.sh
-      # The following step is required by the build-tarballs job.
-      # If this job is being deleted / commented out, make sure
-      # to have another job provide this information.
-      - name: Get Version
-        id: version
-        run: echo "version=$(stage3/bin/zig version)" >> $GITHUB_OUTPUT
+        run: sh ci/x86_64-linux-debug.sh
   x86_64-linux-release:
     runs-on: [self-hosted, Linux, x86_64]
     steps:
       - name: Checkout
         uses: actions/checkout@v3
       - name: Build and Test
-        run: sh ./ci/linux/build-x86_64-release.sh
+        run: sh ci/x86_64-linux-release.sh
+  aarch64-linux-debug:
+    runs-on: [self-hosted, Linux, aarch64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Build and Test
+        run: sh ci/aarch64-linux-debug.sh
+  aarch64-linux-release:
+    runs-on: [self-hosted, Linux, aarch64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Build and Test
+        run: sh ci/aarch64-linux-release.sh
   x86_64-macos:
     runs-on: "macos-11"
-    env: 
+    env:
       ARCH: "x86_64"
     steps:
       - name: Checkout
         uses: actions/checkout@v3
       - name: Build and Test
-        run: ./ci/macos/build-x86_64.sh
+        run: ci/x86_64-macos.sh
+  aarch64-macos:
+    runs-on: [self-hosted, macOS, aarch64]
+    env:
+      ARCH: "aarch64"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Build and Test
+        run: ci/aarch64-macos.sh
   x86_64-windows:
     runs-on: windows-latest
     env: 
@@ -44,20 +63,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
       - name: Build and Test
-        run: ./ci/windows/build.ps1
-  aarch64-linux:
-    runs-on: [self-hosted, Linux, aarch64]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Build and Test
-        run: sh ./ci/linux/build-aarch64.sh
-  aarch64-macos:
-    runs-on: [self-hosted, macOS, aarch64]
-    env: 
+        run: ci/x86_64-windows.ps1
+  aarch64-windows:
+    runs-on: [self-hosted, Windows, aarch64]
+    env:
       ARCH: "aarch64"
     steps:
       - name: Checkout
         uses: actions/checkout@v3
       - name: Build and Test
-        run: ./ci/macos/build-aarch64.sh
+        run: ci/aarch64-windows.ps1

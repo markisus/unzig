@@ -19,7 +19,7 @@ pub const panic = common.panic;
 
 comptime {
     if (builtin.link_libc and (builtin.abi == .android or builtin.os.tag == .openbsd)) {
-        @export(__emutls_get_address, .{ .name = "__emutls_get_address", .linkage = common.linkage });
+        @export(__emutls_get_address, .{ .name = "__emutls_get_address", .linkage = common.linkage, .visibility = common.visibility });
     }
 }
 
@@ -86,12 +86,10 @@ const ObjectArray = struct {
     /// create a new ObjectArray with n slots. must call deinit() to deallocate.
     pub fn init(n: usize) *ObjectArray {
         var array = simple_allocator.alloc(ObjectArray);
-        errdefer simple_allocator.free(array);
 
         array.* = ObjectArray{
             .slots = simple_allocator.allocSlice(?ObjectPointer, n),
         };
-        errdefer simple_allocator.free(array.slots);
 
         for (array.slots) |*object| {
             object.* = null;

@@ -199,7 +199,7 @@ pub fn format(
         switch (missing_count) {
             0 => unreachable,
             1 => @compileError("unused argument in '" ++ fmt ++ "'"),
-            else => @compileError((comptime comptimePrint("{d}", .{missing_count})) ++ " unused arguments in '" ++ fmt ++ "'"),
+            else => @compileError(comptimePrint("{d}", .{missing_count}) ++ " unused arguments in '" ++ fmt ++ "'"),
         }
     }
 }
@@ -827,7 +827,7 @@ fn formatSliceHexImpl(comptime case: Case) type {
     const charset = "0123456789" ++ if (case == .upper) "ABCDEF" else "abcdef";
 
     return struct {
-        pub fn f(
+        pub fn formatSliceHexImpl(
             bytes: []const u8,
             comptime fmt: []const u8,
             options: std.fmt.FormatOptions,
@@ -846,8 +846,8 @@ fn formatSliceHexImpl(comptime case: Case) type {
     };
 }
 
-const formatSliceHexLower = formatSliceHexImpl(.lower).f;
-const formatSliceHexUpper = formatSliceHexImpl(.upper).f;
+const formatSliceHexLower = formatSliceHexImpl(.lower).formatSliceHexImpl;
+const formatSliceHexUpper = formatSliceHexImpl(.upper).formatSliceHexImpl;
 
 /// Return a Formatter for a []const u8 where every byte is formatted as a pair
 /// of lowercase hexadecimal digits.
@@ -865,7 +865,7 @@ fn formatSliceEscapeImpl(comptime case: Case) type {
     const charset = "0123456789" ++ if (case == .upper) "ABCDEF" else "abcdef";
 
     return struct {
-        pub fn f(
+        pub fn formatSliceEscapeImpl(
             bytes: []const u8,
             comptime fmt: []const u8,
             options: std.fmt.FormatOptions,
@@ -891,8 +891,8 @@ fn formatSliceEscapeImpl(comptime case: Case) type {
     };
 }
 
-const formatSliceEscapeLower = formatSliceEscapeImpl(.lower).f;
-const formatSliceEscapeUpper = formatSliceEscapeImpl(.upper).f;
+const formatSliceEscapeLower = formatSliceEscapeImpl(.lower).formatSliceEscapeImpl;
+const formatSliceEscapeUpper = formatSliceEscapeImpl(.upper).formatSliceEscapeImpl;
 
 /// Return a Formatter for a []const u8 where every non-printable ASCII
 /// character is escaped as \xNN, where NN is the character in lowercase
@@ -910,7 +910,7 @@ pub fn fmtSliceEscapeUpper(bytes: []const u8) std.fmt.Formatter(formatSliceEscap
 
 fn formatSizeImpl(comptime radix: comptime_int) type {
     return struct {
-        fn f(
+        fn formatSizeImpl(
             value: u64,
             comptime fmt: []const u8,
             options: FormatOptions,
@@ -958,8 +958,8 @@ fn formatSizeImpl(comptime radix: comptime_int) type {
     };
 }
 
-const formatSizeDec = formatSizeImpl(1000).f;
-const formatSizeBin = formatSizeImpl(1024).f;
+const formatSizeDec = formatSizeImpl(1000).formatSizeImpl;
+const formatSizeBin = formatSizeImpl(1024).formatSizeImpl;
 
 /// Return a Formatter for a u64 value representing a file size.
 /// This formatter represents the number as multiple of 1000 and uses the SI
@@ -1429,12 +1429,29 @@ pub fn formatInt(
 
     var a: MinInt = abs_value;
     var index: usize = buf.len;
-    while (true) {
-        const digit = a % base;
-        index -= 1;
-        buf[index] = digitToChar(@intCast(u8, digit), case);
-        a /= base;
-        if (a == 0) break;
+
+    // TODO isComptime here because of https://github.com/ziglang/zig/issues/13335.
+    if (base == 10 and !isComptime()) {
+        while (a >= 100) : (a = @divTrunc(a, 100)) {
+            index -= 2;
+            buf[index..][0..2].* = digits2(@intCast(usize, a % 100));
+        }
+
+        if (a < 10) {
+            index -= 1;
+            buf[index] = '0' + @intCast(u8, a);
+        } else {
+            index -= 2;
+            buf[index..][0..2].* = digits2(@intCast(usize, a));
+        }
+    } else {
+        while (true) {
+            const digit = a % base;
+            index -= 1;
+            buf[index] = digitToChar(@intCast(u8, digit), case);
+            a /= base;
+            if (a == 0) break;
+        }
     }
 
     if (value_info.signedness == .signed) {
@@ -1454,10 +1471,25 @@ pub fn formatInt(
     return formatBuf(buf[index..], options, writer);
 }
 
+// TODO: Remove once https://github.com/ziglang/zig/issues/868 is resolved.
+fn isComptime() bool {
+    var a: u8 = 0;
+    return @typeInfo(@TypeOf(.{a})).Struct.fields[0].is_comptime;
+}
+
 pub fn formatIntBuf(out_buf: []u8, value: anytype, base: u8, case: Case, options: FormatOptions) usize {
     var fbs = std.io.fixedBufferStream(out_buf);
     formatInt(value, base, case, options, fbs.writer()) catch unreachable;
     return fbs.pos;
+}
+
+// Converts values in the range [0, 100) to a string.
+fn digits2(value: usize) [2]u8 {
+    return ("0001020304050607080910111213141516171819" ++
+        "2021222324252627282930313233343536373839" ++
+        "4041424344454647484950515253545556575859" ++
+        "6061626364656667686970717273747576777879" ++
+        "8081828384858687888990919293949596979899")[value * 2 ..][0..2].*;
 }
 
 const FormatDurationData = struct {
@@ -1692,7 +1724,7 @@ pub const ParseIntError = error{
 ///     ) !void;
 ///
 pub fn Formatter(comptime format_fn: anytype) type {
-    const Data = @typeInfo(@TypeOf(format_fn)).Fn.args[0].arg_type.?;
+    const Data = @typeInfo(@TypeOf(format_fn)).Fn.params[0].type.?;
     return struct {
         data: Data,
         pub fn format(
@@ -2166,8 +2198,9 @@ test "slice" {
 }
 
 test "escape non-printable" {
-    try expectFmt("abc", "{s}", .{fmtSliceEscapeLower("abc")});
+    try expectFmt("abc 123", "{s}", .{fmtSliceEscapeLower("abc 123")});
     try expectFmt("ab\\xffc", "{s}", .{fmtSliceEscapeLower("ab\xffc")});
+    try expectFmt("abc 123", "{s}", .{fmtSliceEscapeUpper("abc 123")});
     try expectFmt("ab\\xFFc", "{s}", .{fmtSliceEscapeUpper("ab\xffc")});
 }
 
@@ -2177,7 +2210,7 @@ test "pointer" {
         try expectFmt("pointer: i32@deadbeef\n", "pointer: {}\n", .{value});
         try expectFmt("pointer: i32@deadbeef\n", "pointer: {*}\n", .{value});
     }
-    const FnPtr = if (builtin.zig_backend == .stage1) fn () void else *align(1) const fn () void;
+    const FnPtr = *align(1) const fn () void;
     {
         const value = @intToPtr(FnPtr, 0xdeadbeef);
         try expectFmt("pointer: fn() void@deadbeef\n", "pointer: {}\n", .{value});
@@ -2234,10 +2267,6 @@ test "struct" {
 }
 
 test "enum" {
-    if (builtin.zig_backend == .stage1) {
-        // stage1 starts the typename with 'std' which might also be desireable for stage2
-        return error.SkipZigTest;
-    }
     const Enum = enum {
         One,
         Two,
@@ -2253,10 +2282,6 @@ test "enum" {
 }
 
 test "non-exhaustive enum" {
-    if (builtin.zig_backend == .stage1) {
-        // stage1 fails to return fully qualified namespaces.
-        return error.SkipZigTest;
-    }
     const Enum = enum(u16) {
         One = 0x000f,
         Two = 0xbeef,
@@ -2430,10 +2455,6 @@ test "custom" {
 }
 
 test "struct" {
-    if (builtin.zig_backend == .stage1) {
-        // stage1 fails to return fully qualified namespaces.
-        return error.SkipZigTest;
-    }
     const S = struct {
         a: u32,
         b: anyerror,
@@ -2452,10 +2473,6 @@ test "struct" {
 }
 
 test "union" {
-    if (builtin.zig_backend == .stage1) {
-        // stage1 fails to return fully qualified namespaces.
-        return error.SkipZigTest;
-    }
     const TU = union(enum) {
         float: f32,
         int: u32,
@@ -2486,10 +2503,6 @@ test "union" {
 }
 
 test "enum" {
-    if (builtin.zig_backend == .stage1) {
-        // stage1 fails to return fully qualified namespaces.
-        return error.SkipZigTest;
-    }
     const E = enum {
         One,
         Two,
@@ -2502,10 +2515,6 @@ test "enum" {
 }
 
 test "struct.self-referential" {
-    if (builtin.zig_backend == .stage1) {
-        // stage1 fails to return fully qualified namespaces.
-        return error.SkipZigTest;
-    }
     const S = struct {
         const SelfType = @This();
         a: ?*SelfType,
@@ -2520,10 +2529,6 @@ test "struct.self-referential" {
 }
 
 test "struct.zero-size" {
-    if (builtin.zig_backend == .stage1) {
-        // stage1 fails to return fully qualified namespaces.
-        return error.SkipZigTest;
-    }
     const A = struct {
         fn foo() void {}
     };
@@ -2601,10 +2606,6 @@ test "formatFloatValue with comptime_float" {
 }
 
 test "formatType max_depth" {
-    if (builtin.zig_backend == .stage1) {
-        // stage1 fails to return fully qualified namespaces.
-        return error.SkipZigTest;
-    }
     const Vec2 = struct {
         const SelfType = @This();
         x: f32,
@@ -2692,12 +2693,6 @@ test "vector" {
         return error.SkipZigTest;
     }
 
-    if (builtin.zig_backend == .stage1) {
-        // Regressed in LLVM 14:
-        // https://github.com/llvm/llvm-project/issues/55522
-        return error.SkipZigTest;
-    }
-
     const vbool: @Vector(4, bool) = [_]bool{ true, false, true, false };
     const vi64: @Vector(4, i64) = [_]i64{ -2, -1, 0, 1 };
     const vu64: @Vector(4, u64) = [_]u64{ 1000, 2000, 3000, 4000 };
@@ -2777,4 +2772,22 @@ test "runtime precision specifier" {
     var precision: usize = 2;
     try expectFmt("3.14e+00", "{:1.[1]}", .{ number, precision });
     try expectFmt("3.14e+00", "{:1.[precision]}", .{ .number = number, .precision = precision });
+}
+
+test "recursive format function" {
+    const R = union(enum) {
+        const R = @This();
+        Leaf: i32,
+        Branch: struct { left: *const R, right: *const R },
+
+        pub fn format(self: R, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            return switch (self) {
+                .Leaf => |n| std.fmt.format(writer, "Leaf({})", .{n}),
+                .Branch => |b| std.fmt.format(writer, "Branch({}, {})", .{ b.left, b.right }),
+            };
+        }
+    };
+
+    var r = R{ .Leaf = 1 };
+    try expectFmt("Leaf(1)\n", "{}\n", .{&r});
 }

@@ -42,6 +42,7 @@ string_table: std.HashMapUnmanaged(u32, void, StringIndexContext, std.hash_map.d
 compile_errors: ArrayListUnmanaged(Zir.Inst.CompileErrors.Item) = .{},
 /// The topmost block of the current function.
 fn_block: ?*GenZir = null,
+fn_var_args: bool = false,
 /// Maps string table indexes to the first `@import` ZIR instruction
 /// that uses this string as the operand.
 imports: std.AutoArrayHashMapUnmanaged(u32, Ast.TokenIndex) = .{},
@@ -79,7 +80,7 @@ fn setExtra(astgen: *AstGen, index: usize, extra: anytype) void {
     const fields = std.meta.fields(@TypeOf(extra));
     var i = index;
     inline for (fields) |field| {
-        astgen.extra.items[i] = switch (field.field_type) {
+        astgen.extra.items[i] = switch (field.type) {
             u32 => @field(extra, field.name),
             Zir.Inst.Ref => @enumToInt(@field(extra, field.name)),
             i32 => @bitCast(u32, @field(extra, field.name)),
@@ -199,8 +200,8 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
 
     return Zir{
         .instructions = astgen.instructions.toOwnedSlice(),
-        .string_bytes = astgen.string_bytes.toOwnedSlice(gpa),
-        .extra = astgen.extra.toOwnedSlice(gpa),
+        .string_bytes = try astgen.string_bytes.toOwnedSlice(gpa),
+        .extra = try astgen.extra.toOwnedSlice(gpa),
     };
 }
 
@@ -2504,7 +2505,6 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .err_union_code,
             .err_union_code_ptr,
             .ptr_type,
-            .overflow_arithmetic_ptr,
             .enum_literal,
             .merge_error_sets,
             .error_union_type,
@@ -2542,7 +2542,6 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .type_info,
             .size_of,
             .bit_size_of,
-            .log2_int_type,
             .typeof_log2_int_type,
             .ptr_to_int,
             .align_of,
@@ -2632,7 +2631,7 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .compile_error,
             .ret_node,
             .ret_load,
-            .ret_tok,
+            .ret_implicit,
             .ret_err_value,
             .@"unreachable",
             .repeat,
@@ -3365,7 +3364,7 @@ fn ptrType(
     var trailing_count: u32 = 0;
 
     if (ptr_info.ast.sentinel != 0) {
-        sentinel_ref = try expr(gz, scope, .{ .rl = .{ .ty = elem_type } }, ptr_info.ast.sentinel);
+        sentinel_ref = try comptimeExpr(gz, scope, .{ .rl = .{ .ty = elem_type } }, ptr_info.ast.sentinel);
         trailing_count += 1;
     }
     if (ptr_info.ast.align_node != 0) {
@@ -3468,7 +3467,7 @@ fn arrayTypeSentinel(gz: *GenZir, scope: *Scope, ri: ResultInfo, node: Ast.Node.
     }
     const len = try reachableExpr(gz, scope, .{ .rl = .{ .coerced_ty = .usize_type } }, len_node, node);
     const elem_type = try typeExpr(gz, scope, extra.elem_type);
-    const sentinel = try reachableExpr(gz, scope, .{ .rl = .{ .coerced_ty = elem_type } }, extra.sentinel, node);
+    const sentinel = try reachableExprComptime(gz, scope, .{ .rl = .{ .coerced_ty = elem_type } }, extra.sentinel, node, true);
 
     const result = try gz.addPlNode(.array_type_sentinel, node, Zir.Inst.ArrayTypeSentinel{
         .len = len,
@@ -3695,6 +3694,29 @@ fn fnDecl(
                 if (param.anytype_ellipsis3) |tok| {
                     return astgen.failTok(tok, "missing parameter name", .{});
                 } else {
+                    ambiguous: {
+                        if (tree.nodes.items(.tag)[param.type_expr] != .identifier) break :ambiguous;
+                        const main_token = tree.nodes.items(.main_token)[param.type_expr];
+                        const identifier_str = tree.tokenSlice(main_token);
+                        if (isPrimitive(identifier_str)) break :ambiguous;
+                        return astgen.failNodeNotes(
+                            param.type_expr,
+                            "missing parameter name or type",
+                            .{},
+                            &[_]u32{
+                                try astgen.errNoteNode(
+                                    param.type_expr,
+                                    "if this is a name, annotate its type '{s}: T'",
+                                    .{identifier_str},
+                                ),
+                                try astgen.errNoteNode(
+                                    param.type_expr,
+                                    "if this is a type, give it a name '<name>: {s}'",
+                                    .{identifier_str},
+                                ),
+                            },
+                        );
+                    }
                     return astgen.failNode(param.type_expr, "missing parameter name", .{});
                 }
             } else 0;
@@ -3868,16 +3890,16 @@ fn fnDecl(
             .noalias_bits = noalias_bits,
         });
     } else func: {
-        if (is_var_args) {
-            return astgen.failTok(fn_proto.ast.fn_token, "non-extern function is variadic", .{});
-        }
-
         // as a scope, fn_gz encloses ret_gz, but for instruction list, fn_gz stacks on ret_gz
         fn_gz.instructions_top = ret_gz.instructions.items.len;
 
         const prev_fn_block = astgen.fn_block;
         astgen.fn_block = &fn_gz;
         defer astgen.fn_block = prev_fn_block;
+
+        const prev_var_args = astgen.fn_var_args;
+        astgen.fn_var_args = is_var_args;
+        defer astgen.fn_var_args = prev_var_args;
 
         astgen.advanceSourceCursorToNode(body_node);
         const lbrace_line = astgen.source_line - decl_gz.decl_line;
@@ -3890,9 +3912,8 @@ fn fnDecl(
             // As our last action before the return, "pop" the error trace if needed
             _ = try gz.addRestoreErrRetIndex(.ret, .always);
 
-            // Since we are adding the return instruction here, we must handle the coercion.
-            // We do this by using the `ret_tok` instruction.
-            _ = try fn_gz.addUnTok(.ret_tok, .void_value, tree.lastToken(body_node));
+            // Add implicit return at end of function.
+            _ = try fn_gz.addUnTok(.ret_implicit, .void_value, tree.lastToken(body_node));
         }
 
         break :func try decl_gz.addFunc(.{
@@ -4310,9 +4331,8 @@ fn testDecl(
         // As our last action before the return, "pop" the error trace if needed
         _ = try gz.addRestoreErrRetIndex(.ret, .always);
 
-        // Since we are adding the return instruction here, we must handle the coercion.
-        // We do this by using the `ret_tok` instruction.
-        _ = try fn_block.addUnTok(.ret_tok, .void_value, tree.lastToken(body_node));
+        // Add implicit return at end of function.
+        _ = try fn_block.addUnTok(.ret_implicit, .void_value, tree.lastToken(body_node));
     }
 
     const func_inst = try decl_block.addFunc(.{
@@ -4385,6 +4405,7 @@ fn structDeclInner(
             .backing_int_body_len = 0,
             .known_non_opv = false,
             .known_comptime_only = false,
+            .is_tuple = false,
         });
         return indexToRef(decl_inst);
     }
@@ -4466,22 +4487,53 @@ fn structDeclInner(
     // No defer needed here because it is handled by `wip_members.deinit()` above.
     const bodies_start = astgen.scratch.items.len;
 
+    var is_tuple = false;
+    const node_tags = tree.nodes.items(.tag);
+    for (container_decl.ast.members) |member_node| {
+        switch (node_tags[member_node]) {
+            .container_field_init => is_tuple = tree.containerFieldInit(member_node).ast.tuple_like,
+            .container_field_align => is_tuple = tree.containerFieldAlign(member_node).ast.tuple_like,
+            .container_field => is_tuple = tree.containerField(member_node).ast.tuple_like,
+            else => continue,
+        }
+        if (is_tuple) break;
+    }
+    if (is_tuple) for (container_decl.ast.members) |member_node| {
+        switch (node_tags[member_node]) {
+            .container_field_init,
+            .container_field_align,
+            .container_field,
+            .@"comptime",
+            => continue,
+            else => {
+                return astgen.failNode(member_node, "tuple declarations cannot contain declarations", .{});
+            },
+        }
+    };
+
     var known_non_opv = false;
     var known_comptime_only = false;
     for (container_decl.ast.members) |member_node| {
-        const member = switch (try containerMember(&block_scope, &namespace.base, &wip_members, member_node)) {
+        var member = switch (try containerMember(&block_scope, &namespace.base, &wip_members, member_node)) {
             .decl => continue,
             .field => |field| field,
         };
 
-        const field_name = try astgen.identAsString(member.ast.name_token);
-        wip_members.appendToField(field_name);
+        if (!is_tuple) {
+            member.convertToNonTupleLike(astgen.tree.nodes);
+            assert(!member.ast.tuple_like);
+
+            const field_name = try astgen.identAsString(member.ast.main_token);
+            wip_members.appendToField(field_name);
+        } else if (!member.ast.tuple_like) {
+            return astgen.failTok(member.ast.main_token, "tuple field has a name", .{});
+        }
 
         const doc_comment_index = try astgen.docCommentAsString(member.firstToken());
         wip_members.appendToField(doc_comment_index);
 
         if (member.ast.type_expr == 0) {
-            return astgen.failTok(member.ast.name_token, "struct field missing type", .{});
+            return astgen.failTok(member.ast.main_token, "struct field missing type", .{});
         }
 
         const field_type = try typeExpr(&block_scope, &namespace.base, member.ast.type_expr);
@@ -4561,6 +4613,7 @@ fn structDeclInner(
         .backing_int_body_len = @intCast(u32, backing_int_body_len),
         .known_non_opv = known_non_opv,
         .known_comptime_only = known_comptime_only,
+        .is_tuple = is_tuple,
     });
 
     wip_members.finishBits(bits_per_field);
@@ -4639,15 +4692,19 @@ fn unionDeclInner(
     defer wip_members.deinit();
 
     for (members) |member_node| {
-        const member = switch (try containerMember(&block_scope, &namespace.base, &wip_members, member_node)) {
+        var member = switch (try containerMember(&block_scope, &namespace.base, &wip_members, member_node)) {
             .decl => continue,
             .field => |field| field,
         };
+        member.convertToNonTupleLike(astgen.tree.nodes);
+        if (member.ast.tuple_like) {
+            return astgen.failTok(member.ast.main_token, "union field missing name", .{});
+        }
         if (member.comptime_token) |comptime_token| {
             return astgen.failTok(comptime_token, "union fields cannot be marked comptime", .{});
         }
 
-        const field_name = try astgen.identAsString(member.ast.name_token);
+        const field_name = try astgen.identAsString(member.ast.main_token);
         wip_members.appendToField(field_name);
 
         const doc_comment_index = try astgen.docCommentAsString(member.firstToken());
@@ -4786,7 +4843,7 @@ fn containerDecl(
                 var nonexhaustive_node: Ast.Node.Index = 0;
                 var nonfinal_nonexhaustive = false;
                 for (container_decl.ast.members) |member_node| {
-                    const member = switch (node_tags[member_node]) {
+                    var member = switch (node_tags[member_node]) {
                         .container_field_init => tree.containerFieldInit(member_node),
                         .container_field_align => tree.containerFieldAlign(member_node),
                         .container_field => tree.containerField(member_node),
@@ -4795,6 +4852,10 @@ fn containerDecl(
                             continue;
                         },
                     };
+                    member.convertToNonTupleLike(astgen.tree.nodes);
+                    if (member.ast.tuple_like) {
+                        return astgen.failTok(member.ast.main_token, "enum field missing name", .{});
+                    }
                     if (member.comptime_token) |comptime_token| {
                         return astgen.failTok(comptime_token, "enum fields cannot be marked comptime", .{});
                     }
@@ -4812,10 +4873,11 @@ fn containerDecl(
                             },
                         );
                     }
-                    // Alignment expressions in enums are caught by the parser.
-                    assert(member.ast.align_expr == 0);
+                    if (member.ast.align_expr != 0) {
+                        return astgen.failNode(member.ast.align_expr, "enum fields cannot be aligned", .{});
+                    }
 
-                    const name_token = member.ast.name_token;
+                    const name_token = member.ast.main_token;
                     if (mem.eql(u8, tree.tokenSlice(name_token), "_")) {
                         if (nonexhaustive_node != 0) {
                             return astgen.failNodeNotes(
@@ -4914,15 +4976,16 @@ fn containerDecl(
             for (container_decl.ast.members) |member_node| {
                 if (member_node == counts.nonexhaustive_node)
                     continue;
-                const member = switch (try containerMember(&block_scope, &namespace.base, &wip_members, member_node)) {
+                var member = switch (try containerMember(&block_scope, &namespace.base, &wip_members, member_node)) {
                     .decl => continue,
                     .field => |field| field,
                 };
+                member.convertToNonTupleLike(astgen.tree.nodes);
                 assert(member.comptime_token == null);
                 assert(member.ast.type_expr == 0);
                 assert(member.ast.align_expr == 0);
 
-                const field_name = try astgen.identAsString(member.ast.name_token);
+                const field_name = try astgen.identAsString(member.ast.main_token);
                 wip_members.appendToField(field_name);
 
                 const doc_comment_index = try astgen.docCommentAsString(member.firstToken());
@@ -5026,6 +5089,7 @@ fn containerDecl(
             try astgen.extra.ensureUnusedCapacity(gpa, decls_slice.len);
             astgen.extra.appendSliceAssumeCapacity(decls_slice);
 
+            block_scope.unstack();
             try gz.addNamespaceCaptures(&namespace);
             return rvalue(gz, ri, indexToRef(decl_inst), node);
         },
@@ -5560,6 +5624,14 @@ fn simpleBinOp(
     const tree = astgen.tree;
     const node_datas = tree.nodes.items(.data);
 
+    if (op_inst_tag == .cmp_neq or op_inst_tag == .cmp_eq) {
+        const node_tags = tree.nodes.items(.tag);
+        const str = if (op_inst_tag == .cmp_eq) "==" else "!=";
+        if (node_tags[node_datas[node].lhs] == .string_literal or
+            node_tags[node_datas[node].rhs] == .string_literal)
+            return astgen.failNode(node, "cannot compare strings with {s}", .{str});
+    }
+
     const lhs = try reachableExpr(gz, scope, .{ .rl = .none }, node_datas[node].lhs, node);
     var line: u32 = undefined;
     var column: u32 = undefined;
@@ -5997,7 +6069,7 @@ fn whileExpr(
             const tag: Zir.Inst.Tag = if (payload_is_ref) .is_non_err_ptr else .is_non_err;
             break :c .{
                 .inst = err_union,
-                .bool_bit = try cond_scope.addUnNode(tag, err_union, while_full.ast.then_expr),
+                .bool_bit = try cond_scope.addUnNode(tag, err_union, while_full.ast.cond_expr),
             };
         } else if (while_full.payload_token) |_| {
             const cond_ri: ResultInfo = .{ .rl = if (payload_is_ref) .ref else .none };
@@ -6005,7 +6077,7 @@ fn whileExpr(
             const tag: Zir.Inst.Tag = if (payload_is_ref) .is_non_null_ptr else .is_non_null;
             break :c .{
                 .inst = optional,
-                .bool_bit = try cond_scope.addUnNode(tag, optional, while_full.ast.then_expr),
+                .bool_bit = try cond_scope.addUnNode(tag, optional, while_full.ast.cond_expr),
             };
         } else {
             const cond = try expr(&cond_scope, &cond_scope.base, bool_ri, while_full.ast.cond_expr);
@@ -6557,6 +6629,11 @@ fn switchExpr(
             continue;
         }
 
+        for (case.ast.values) |val| {
+            if (node_tags[val] == .string_literal)
+                return astgen.failNode(val, "cannot switch on strings", .{});
+        }
+
         if (case.ast.values.len == 1 and node_tags[case.ast.values[0]] != .switch_range) {
             scalar_cases_len += 1;
         } else {
@@ -6864,7 +6941,13 @@ fn switchExpr(
                 // it as the break operand.
                 if (body_len < 2)
                     break :blk;
-                const store_inst = payloads.items[end_index - 2];
+
+                var store_index = end_index - 2;
+                while (true) : (store_index -= 1) switch (zir_tags[payloads.items[store_index]]) {
+                    .dbg_block_end, .dbg_block_begin, .dbg_stmt, .dbg_var_val, .dbg_var_ptr => {},
+                    else => break,
+                };
+                const store_inst = payloads.items[store_index];
                 if (zir_tags[store_inst] != .store_to_block_ptr or
                     zir_datas[store_inst].bin.lhs != block_scope.rl_ptr)
                     break :blk;
@@ -7673,6 +7756,7 @@ fn typeOf(
 
         var typeof_scope = gz.makeSubBlock(scope);
         typeof_scope.force_comptime = false;
+        typeof_scope.c_import = false;
         defer typeof_scope.unstack();
 
         const ty_expr = try reachableExpr(&typeof_scope, &typeof_scope.base, .{ .rl = .none }, args[0], node);
@@ -8155,21 +8239,7 @@ fn builtinCall(
         .add_with_overflow => return overflowArithmetic(gz, scope, ri, node, params, .add_with_overflow),
         .sub_with_overflow => return overflowArithmetic(gz, scope, ri, node, params, .sub_with_overflow),
         .mul_with_overflow => return overflowArithmetic(gz, scope, ri, node, params, .mul_with_overflow),
-        .shl_with_overflow => {
-            const int_type = try typeExpr(gz, scope, params[0]);
-            const log2_int_type = try gz.addUnNode(.log2_int_type, int_type, params[0]);
-            const ptr_type = try gz.addUnNode(.overflow_arithmetic_ptr, int_type, params[0]);
-            const lhs = try expr(gz, scope, .{ .rl = .{ .ty = int_type } }, params[1]);
-            const rhs = try expr(gz, scope, .{ .rl = .{ .ty = log2_int_type } }, params[2]);
-            const ptr = try expr(gz, scope, .{ .rl = .{ .ty = ptr_type } }, params[3]);
-            const result = try gz.addExtendedPayload(.shl_with_overflow, Zir.Inst.OverflowArithmetic{
-                .node = gz.nodeIndexToRelative(node),
-                .lhs = lhs,
-                .rhs = rhs,
-                .ptr = ptr,
-            });
-            return rvalue(gz, ri, result, node);
-        },
+        .shl_with_overflow => return overflowArithmetic(gz, scope, ri, node, params, .shl_with_overflow),
 
         .atomic_load => {
             const result = try gz.addPlNode(.atomic_load, node, Zir.Inst.AtomicLoad{
@@ -8217,11 +8287,11 @@ fn builtinCall(
             return rvalue(gz, ri, result, node);
         },
         .call => {
-            const options = try comptimeExpr(gz, scope, .{ .rl = .{ .ty = .call_options_type } }, params[0]);
+            const modifier = try comptimeExpr(gz, scope, .{ .rl = .{ .coerced_ty = .modifier_type } }, params[0]);
             const callee = try calleeExpr(gz, scope, params[1]);
             const args = try expr(gz, scope, .{ .rl = .none }, params[2]);
             const result = try gz.addPlNode(.builtin_call, node, Zir.Inst.BuiltinCall{
-                .options = options,
+                .modifier = modifier,
                 .callee = callee,
                 .args = args,
                 .flags = .{
@@ -8304,6 +8374,46 @@ fn builtinCall(
             });
             return rvalue(gz, ri, result, node);
         },
+        .c_va_arg => {
+            if (astgen.fn_block == null) {
+                return astgen.failNode(node, "'@cVaArg' outside function scope", .{});
+            }
+            const result = try gz.addExtendedPayload(.c_va_arg, Zir.Inst.BinNode{
+                .node = gz.nodeIndexToRelative(node),
+                .lhs = try expr(gz, scope, .{ .rl = .none }, params[0]),
+                .rhs = try typeExpr(gz, scope, params[1]),
+            });
+            return rvalue(gz, ri, result, node);
+        },
+        .c_va_copy => {
+            if (astgen.fn_block == null) {
+                return astgen.failNode(node, "'@cVaCopy' outside function scope", .{});
+            }
+            const result = try gz.addExtendedPayload(.c_va_copy, Zir.Inst.UnNode{
+                .node = gz.nodeIndexToRelative(node),
+                .operand = try expr(gz, scope, .{ .rl = .none }, params[0]),
+            });
+            return rvalue(gz, ri, result, node);
+        },
+        .c_va_end => {
+            if (astgen.fn_block == null) {
+                return astgen.failNode(node, "'@cVaEnd' outside function scope", .{});
+            }
+            const result = try gz.addExtendedPayload(.c_va_end, Zir.Inst.UnNode{
+                .node = gz.nodeIndexToRelative(node),
+                .operand = try expr(gz, scope, .{ .rl = .none }, params[0]),
+            });
+            return rvalue(gz, ri, result, node);
+        },
+        .c_va_start => {
+            if (astgen.fn_block == null) {
+                return astgen.failNode(node, "'@cVaStart' outside function scope", .{});
+            }
+            if (!astgen.fn_var_args) {
+                return astgen.failNode(node, "'@cVaStart' in a non-variadic function", .{});
+            }
+            return rvalue(gz, ri, try gz.addNodeExtended(.c_va_start, node), node);
+        },
     }
 }
 
@@ -8375,8 +8485,12 @@ fn simpleUnOp(
     operand_node: Ast.Node.Index,
     tag: Zir.Inst.Tag,
 ) InnerError!Zir.Inst.Ref {
+    const prev_force_comptime = gz.force_comptime;
+    defer gz.force_comptime = prev_force_comptime;
+
     switch (tag) {
         .tag_name, .error_name, .ptr_to_int => try emitDbgNode(gz, node),
+        .compile_error => gz.force_comptime = true,
         else => {},
     }
     const operand = try expr(gz, scope, operand_ri, operand_node);
@@ -8505,11 +8619,18 @@ fn shiftOp(
     rhs_node: Ast.Node.Index,
     tag: Zir.Inst.Tag,
 ) InnerError!Zir.Inst.Ref {
+    var line = gz.astgen.source_line - gz.decl_line;
+    var column = gz.astgen.source_column;
     const lhs = try expr(gz, scope, .{ .rl = .none }, lhs_node);
 
-    maybeAdvanceSourceCursorToMainToken(gz, node);
-    const line = gz.astgen.source_line - gz.decl_line;
-    const column = gz.astgen.source_column;
+    switch (gz.astgen.tree.nodes.items(.tag)[node]) {
+        .shl, .shr => {
+            maybeAdvanceSourceCursorToMainToken(gz, node);
+            line = gz.astgen.source_line - gz.decl_line;
+            column = gz.astgen.source_column;
+        },
+        else => {},
+    }
 
     const log2_int_type = try gz.addUnNode(.typeof_log2_int_type, lhs, lhs_node);
     const rhs = try expr(gz, scope, .{ .rl = .{ .ty = log2_int_type }, .ctx = .shift_op }, rhs_node);
@@ -8530,6 +8651,8 @@ fn cImport(
 ) InnerError!Zir.Inst.Ref {
     const astgen = gz.astgen;
     const gpa = astgen.gpa;
+
+    if (gz.c_import) return gz.astgen.failNode(node, "cannot nest @cImport", .{});
 
     var block_scope = gz.makeSubBlock(scope);
     block_scope.force_comptime = true;
@@ -8557,16 +8680,12 @@ fn overflowArithmetic(
     params: []const Ast.Node.Index,
     tag: Zir.Inst.Extended,
 ) InnerError!Zir.Inst.Ref {
-    const int_type = try typeExpr(gz, scope, params[0]);
-    const ptr_type = try gz.addUnNode(.overflow_arithmetic_ptr, int_type, params[0]);
-    const lhs = try expr(gz, scope, .{ .rl = .{ .ty = int_type } }, params[1]);
-    const rhs = try expr(gz, scope, .{ .rl = .{ .ty = int_type } }, params[2]);
-    const ptr = try expr(gz, scope, .{ .rl = .{ .ty = ptr_type } }, params[3]);
-    const result = try gz.addExtendedPayload(tag, Zir.Inst.OverflowArithmetic{
+    const lhs = try expr(gz, scope, .{ .rl = .none }, params[0]);
+    const rhs = try expr(gz, scope, .{ .rl = .none }, params[1]);
+    const result = try gz.addExtendedPayload(tag, Zir.Inst.BinNode{
         .node = gz.nodeIndexToRelative(node),
         .lhs = lhs,
         .rhs = rhs,
-        .ptr = ptr,
     });
     return rvalue(gz, ri, result, node);
 }
@@ -8581,7 +8700,7 @@ fn callExpr(
     const astgen = gz.astgen;
 
     const callee = try calleeExpr(gz, scope, call.ast.fn_expr);
-    const modifier: std.builtin.CallOptions.Modifier = blk: {
+    const modifier: std.builtin.CallModifier = blk: {
         if (gz.force_comptime) {
             break :blk .compile_time;
         }
@@ -9005,6 +9124,8 @@ fn nodeMayNeedMemoryLocation(tree: *const Ast, start_node: Ast.Node.Index, have_
                     .always => return true,
                     .forward1 => node = node_datas[node].rhs,
                 }
+                // Missing builtin arg is not a parsing error, expect an error later.
+                if (node == 0) return false;
             },
 
             .builtin_call, .builtin_call_comma => {
@@ -9019,6 +9140,8 @@ fn nodeMayNeedMemoryLocation(tree: *const Ast, start_node: Ast.Node.Index, have_
                     .always => return true,
                     .forward1 => node = params[1],
                 }
+                // Missing builtin arg is not a parsing error, expect an error later.
+                if (node == 0) return false;
             },
         }
     }
@@ -11785,6 +11908,7 @@ const GenZir = struct {
         layout: std.builtin.Type.ContainerLayout,
         known_non_opv: bool,
         known_comptime_only: bool,
+        is_tuple: bool,
     }) !void {
         const astgen = gz.astgen;
         const gpa = astgen.gpa;
@@ -11819,6 +11943,7 @@ const GenZir = struct {
                     .has_backing_int = args.backing_int_ref != .none,
                     .known_non_opv = args.known_non_opv,
                     .known_comptime_only = args.known_comptime_only,
+                    .is_tuple = args.is_tuple,
                     .name_strategy = gz.anon_name_strategy,
                     .layout = args.layout,
                 }),
@@ -12030,7 +12155,7 @@ const GenZir = struct {
 
         const new_index = @intCast(Zir.Inst.Index, gz.astgen.instructions.len);
         try gz.astgen.instructions.append(gpa, .{ .tag = .dbg_block_end, .data = undefined });
-        try gz.instructions.insert(gpa, gz.instructions.items.len - 1, new_index);
+        try gz.instructions.append(gpa, new_index);
     }
 };
 

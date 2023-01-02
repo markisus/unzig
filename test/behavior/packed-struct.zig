@@ -5,37 +5,8 @@ const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const native_endian = builtin.cpu.arch.endian();
 
-test "correct size of packed structs" {
-    // Stage2 has different packed struct semantics.
-    if (builtin.zig_backend != .stage1) return error.SkipZigTest;
-    const T1 = packed struct { one: u8, three: [3]u8 };
-
-    try expectEqual(4, @sizeOf(T1));
-    try expectEqual(4 * 8, @bitSizeOf(T1));
-
-    const T2 = packed struct { three: [3]u8, one: u8 };
-
-    try expectEqual(4, @sizeOf(T2));
-    try expectEqual(4 * 8, @bitSizeOf(T2));
-
-    const T3 = packed struct { _1: u1, x: u7, _: u24 };
-
-    try expectEqual(4, @sizeOf(T3));
-    try expectEqual(4 * 8, @bitSizeOf(T3));
-
-    const T4 = packed struct { _1: u1, x: u7, _2: u8, _3: u16 };
-
-    try expectEqual(4, @sizeOf(T4));
-    try expectEqual(4 * 8, @bitSizeOf(T4));
-
-    const T5 = packed struct { _1: u1, x: u7, _2: u16, _3: u8 };
-
-    try expectEqual(4, @sizeOf(T5));
-    try expectEqual(4 * 8, @bitSizeOf(T5));
-}
-
 test "flags in packed structs" {
-    if (builtin.zig_backend == .stage1) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const Flags1 = packed struct {
         // first 8 bits
@@ -121,7 +92,7 @@ test "flags in packed structs" {
 }
 
 test "consistent size of packed structs" {
-    if (builtin.zig_backend == .stage1) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const TxData1 = packed struct { data: u8, _23: u23, full: bool = false };
     const TxData2 = packed struct { data: u9, _22: u22, full: bool = false };
@@ -149,8 +120,6 @@ test "consistent size of packed structs" {
 }
 
 test "correct sizeOf and offsets in packed structs" {
-    if (builtin.zig_backend == .stage1) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
@@ -219,8 +188,6 @@ test "correct sizeOf and offsets in packed structs" {
 }
 
 test "nested packed structs" {
-    if (builtin.zig_backend == .stage1) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
@@ -267,7 +234,6 @@ test "nested packed structs" {
 }
 
 test "regular in irregular packed struct" {
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
@@ -288,8 +254,6 @@ test "regular in irregular packed struct" {
 }
 
 test "byte-aligned field pointer offsets" {
-    if (builtin.zig_backend == .stage1) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
@@ -391,11 +355,10 @@ test "byte-aligned field pointer offsets" {
 }
 
 test "load pointer from packed struct" {
-    if (builtin.zig_backend == .stage1) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const A = struct {
         index: u16,
@@ -413,10 +376,10 @@ test "load pointer from packed struct" {
 }
 
 test "@ptrToInt on a packed struct field" {
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const S = struct {
         const P = packed struct {
@@ -437,7 +400,7 @@ test "optional pointer in packed struct" {
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const T = packed struct { ptr: ?*const u8 };
     var n: u8 = 0;
@@ -451,6 +414,7 @@ test "nested packed struct field access test" {
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     //
     const Vec2 = packed struct {
         x: f32,
@@ -566,8 +530,8 @@ test "nested packed struct field access test" {
 test "runtime init of unnamed packed struct type" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     var z: u8 = 123;
     try (packed struct {
@@ -579,11 +543,10 @@ test "runtime init of unnamed packed struct type" {
 }
 
 test "packed struct passed to callconv(.C) function" {
-    if (builtin.zig_backend == .stage1) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const S = struct {
         const Packed = packed struct {
@@ -603,4 +566,36 @@ test "packed struct passed to callconv(.C) function" {
         .c = true,
     }, 5, 4, 3, 2, 1);
     try expect(result);
+}
+
+test "overaligned pointer to packed struct" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
+
+    const S = packed struct { a: u32, b: u32 };
+    var foo: S align(4) = .{ .a = 123, .b = 456 };
+    const ptr: *align(4) S = &foo;
+    switch (comptime builtin.cpu.arch.endian()) {
+        .Little => {
+            const ptr_to_b: *u32 = &ptr.b;
+            try expect(ptr_to_b.* == 456);
+        },
+        .Big => {
+            // Byte aligned packed struct field pointers have not been implemented yet.
+            const ptr_to_a: *align(4:0:8) u32 = &ptr.a;
+            try expect(ptr_to_a.* == 123);
+        },
+    }
+}
+
+test "packed struct initialized in bitcast" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
+
+    const T = packed struct { val: u8 };
+    var val: u8 = 123;
+    const t = @bitCast(u8, T{ .val = val });
+    try expect(t == val);
 }

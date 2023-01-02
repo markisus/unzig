@@ -40,14 +40,34 @@ pub fn renderTree(buffer: *std.ArrayList(u8), tree: Ast) Error!void {
 /// Render all members in the given slice, keeping empty lines where appropriate
 fn renderMembers(gpa: Allocator, ais: *Ais, tree: Ast, members: []const Ast.Node.Index) Error!void {
     if (members.len == 0) return;
-    try renderMember(gpa, ais, tree, members[0], .newline);
+    var is_tuple = true;
+    for (members) |member| {
+        const tuple_like = switch (tree.nodes.items(.tag)[member]) {
+            .container_field_init => tree.containerFieldInit(member).ast.tuple_like,
+            .container_field_align => tree.containerFieldAlign(member).ast.tuple_like,
+            .container_field => tree.containerField(member).ast.tuple_like,
+            else => continue,
+        };
+        if (!tuple_like) {
+            is_tuple = false;
+            break;
+        }
+    }
+    try renderMember(gpa, ais, tree, members[0], is_tuple, .newline);
     for (members[1..]) |member| {
         try renderExtraNewline(ais, tree, member);
-        try renderMember(gpa, ais, tree, member, .newline);
+        try renderMember(gpa, ais, tree, member, is_tuple, .newline);
     }
 }
 
-fn renderMember(gpa: Allocator, ais: *Ais, tree: Ast, decl: Ast.Node.Index, space: Space) Error!void {
+fn renderMember(
+    gpa: Allocator,
+    ais: *Ais,
+    tree: Ast,
+    decl: Ast.Node.Index,
+    is_tuple: bool,
+    space: Space,
+) Error!void {
     const token_tags = tree.tokens.items(.tag);
     const main_tokens = tree.nodes.items(.main_token);
     const datas = tree.nodes.items(.data);
@@ -161,9 +181,9 @@ fn renderMember(gpa: Allocator, ais: *Ais, tree: Ast, decl: Ast.Node.Index, spac
             try renderExpression(gpa, ais, tree, datas[decl].rhs, space);
         },
 
-        .container_field_init => return renderContainerField(gpa, ais, tree, tree.containerFieldInit(decl), space),
-        .container_field_align => return renderContainerField(gpa, ais, tree, tree.containerFieldAlign(decl), space),
-        .container_field => return renderContainerField(gpa, ais, tree, tree.containerField(decl), space),
+        .container_field_init => return renderContainerField(gpa, ais, tree, tree.containerFieldInit(decl), is_tuple, space),
+        .container_field_align => return renderContainerField(gpa, ais, tree, tree.containerFieldAlign(decl), is_tuple, space),
+        .container_field => return renderContainerField(gpa, ais, tree, tree.containerField(decl), is_tuple, space),
         .@"comptime" => return renderExpression(gpa, ais, tree, decl, space),
 
         .root => unreachable,
@@ -187,18 +207,9 @@ fn renderExpression(gpa: Allocator, ais: *Ais, tree: Ast, node: Ast.Node.Index, 
     const node_tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     switch (node_tags[node]) {
-        // TODO remove this c_void -> anyopaque rewrite after the 0.10.0 release.
-        // Also get rid of renderSpace() as it will no longer be necessary.
         .identifier => {
             const token_index = main_tokens[node];
-
-            const lexeme = tokenSliceForRender(tree, token_index);
-            if (mem.eql(u8, lexeme, "c_void")) {
-                try ais.writer().writeAll("anyopaque");
-                return renderSpace(ais, tree, token_index, lexeme.len, space);
-            } else {
-                return renderIdentifier(ais, tree, token_index, space, .preserve_when_shadowing);
-            }
+            return renderIdentifier(ais, tree, token_index, space, .preserve_when_shadowing);
         },
 
         .number_literal,
@@ -1158,18 +1169,34 @@ fn renderContainerField(
     gpa: Allocator,
     ais: *Ais,
     tree: Ast,
-    field: Ast.full.ContainerField,
+    field_param: Ast.full.ContainerField,
+    is_tuple: bool,
     space: Space,
 ) Error!void {
+    var field = field_param;
+    if (!is_tuple) field.convertToNonTupleLike(tree.nodes);
+
     if (field.comptime_token) |t| {
         try renderToken(ais, tree, t, .space); // comptime
     }
     if (field.ast.type_expr == 0 and field.ast.value_expr == 0) {
-        return renderIdentifierComma(ais, tree, field.ast.name_token, space, .eagerly_unquote); // name
+        if (field.ast.align_expr != 0) {
+            try renderIdentifier(ais, tree, field.ast.main_token, .space, .eagerly_unquote); // name
+            const lparen_token = tree.firstToken(field.ast.align_expr) - 1;
+            const align_kw = lparen_token - 1;
+            const rparen_token = tree.lastToken(field.ast.align_expr) + 1;
+            try renderToken(ais, tree, align_kw, .none); // align
+            try renderToken(ais, tree, lparen_token, .none); // (
+            try renderExpression(gpa, ais, tree, field.ast.align_expr, .none); // alignment
+            return renderToken(ais, tree, rparen_token, .space); // )
+        }
+        return renderIdentifierComma(ais, tree, field.ast.main_token, space, .eagerly_unquote); // name
     }
     if (field.ast.type_expr != 0 and field.ast.value_expr == 0) {
-        try renderIdentifier(ais, tree, field.ast.name_token, .none, .eagerly_unquote); // name
-        try renderToken(ais, tree, field.ast.name_token + 1, .space); // :
+        if (!field.ast.tuple_like) {
+            try renderIdentifier(ais, tree, field.ast.main_token, .none, .eagerly_unquote); // name
+            try renderToken(ais, tree, field.ast.main_token + 1, .space); // :
+        }
 
         if (field.ast.align_expr != 0) {
             try renderExpression(gpa, ais, tree, field.ast.type_expr, .space); // type
@@ -1184,13 +1211,23 @@ fn renderContainerField(
         }
     }
     if (field.ast.type_expr == 0 and field.ast.value_expr != 0) {
-        try renderIdentifier(ais, tree, field.ast.name_token, .space, .eagerly_unquote); // name
-        try renderToken(ais, tree, field.ast.name_token + 1, .space); // =
+        try renderIdentifier(ais, tree, field.ast.main_token, .space, .eagerly_unquote); // name
+        if (field.ast.align_expr != 0) {
+            const lparen_token = tree.firstToken(field.ast.align_expr) - 1;
+            const align_kw = lparen_token - 1;
+            const rparen_token = tree.lastToken(field.ast.align_expr) + 1;
+            try renderToken(ais, tree, align_kw, .none); // align
+            try renderToken(ais, tree, lparen_token, .none); // (
+            try renderExpression(gpa, ais, tree, field.ast.align_expr, .none); // alignment
+            try renderToken(ais, tree, rparen_token, .space); // )
+        }
+        try renderToken(ais, tree, field.ast.main_token + 1, .space); // =
         return renderExpressionComma(gpa, ais, tree, field.ast.value_expr, space); // value
     }
-
-    try renderIdentifier(ais, tree, field.ast.name_token, .none, .eagerly_unquote); // name
-    try renderToken(ais, tree, field.ast.name_token + 1, .space); // :
+    if (!field.ast.tuple_like) {
+        try renderIdentifier(ais, tree, field.ast.main_token, .none, .eagerly_unquote); // name
+        try renderToken(ais, tree, field.ast.main_token + 1, .space); // :
+    }
     try renderExpression(gpa, ais, tree, field.ast.type_expr, .space); // type
 
     if (field.ast.align_expr != 0) {
@@ -1638,7 +1675,12 @@ fn renderStructInit(
 
         try renderToken(ais, tree, struct_init.ast.lbrace + 1, .none); // .
         try renderIdentifier(ais, tree, struct_init.ast.lbrace + 2, .space, .eagerly_unquote); // name
-        try renderToken(ais, tree, struct_init.ast.lbrace + 3, .space); // =
+        // Don't output a space after the = if expression is a multiline string,
+        // since then it will start on the next line.
+        const nodes = tree.nodes.items(.tag);
+        const expr = nodes[struct_init.ast.fields[0]];
+        var space_after_equal: Space = if (expr == .multiline_string_literal) .none else .space;
+        try renderToken(ais, tree, struct_init.ast.lbrace + 3, space_after_equal); // =
         try renderExpression(gpa, ais, tree, struct_init.ast.fields[0], .comma);
 
         for (struct_init.ast.fields[1..]) |field_init| {
@@ -1646,7 +1688,8 @@ fn renderStructInit(
             try renderExtraNewlineToken(ais, tree, init_token - 3);
             try renderToken(ais, tree, init_token - 3, .none); // .
             try renderIdentifier(ais, tree, init_token - 2, .space, .eagerly_unquote); // name
-            try renderToken(ais, tree, init_token - 1, .space); // =
+            space_after_equal = if (nodes[field_init] == .multiline_string_literal) .none else .space;
+            try renderToken(ais, tree, init_token - 1, space_after_equal); // =
             try renderExpression(gpa, ais, tree, field_init, .comma);
         }
 
@@ -1901,6 +1944,20 @@ fn renderContainerDecl(
         try renderToken(ais, tree, layout_token, .space);
     }
 
+    var is_tuple = token_tags[container_decl.ast.main_token] == .keyword_struct;
+    if (is_tuple) for (container_decl.ast.members) |member| {
+        const tuple_like = switch (tree.nodes.items(.tag)[member]) {
+            .container_field_init => tree.containerFieldInit(member).ast.tuple_like,
+            .container_field_align => tree.containerFieldAlign(member).ast.tuple_like,
+            .container_field => tree.containerField(member).ast.tuple_like,
+            else => continue,
+        };
+        if (!tuple_like) {
+            is_tuple = false;
+            break;
+        }
+    };
+
     var lbrace: Ast.TokenIndex = undefined;
     if (container_decl.ast.enum_token) |enum_token| {
         try renderToken(ais, tree, container_decl.ast.main_token, .none); // union
@@ -1967,7 +2024,7 @@ fn renderContainerDecl(
         // Print all the declarations on the same line.
         try renderToken(ais, tree, lbrace, .space); // lbrace
         for (container_decl.ast.members) |member| {
-            try renderMember(gpa, ais, tree, member, .space);
+            try renderMember(gpa, ais, tree, member, is_tuple, .space);
         }
         return renderToken(ais, tree, rbrace, space); // rbrace
     }
@@ -1985,9 +2042,9 @@ fn renderContainerDecl(
             .container_field_init,
             .container_field_align,
             .container_field,
-            => try renderMember(gpa, ais, tree, member, .comma),
+            => try renderMember(gpa, ais, tree, member, is_tuple, .comma),
 
-            else => try renderMember(gpa, ais, tree, member, .newline),
+            else => try renderMember(gpa, ais, tree, member, is_tuple, .newline),
         }
     }
     ais.popIndent();
@@ -2151,7 +2208,7 @@ fn renderAsm(
             },
             else => unreachable,
         }
-    } else unreachable; // TODO shouldn't need this on while(true)
+    }
 }
 
 fn renderCall(
@@ -2588,7 +2645,7 @@ fn renderComments(ais: *Ais, tree: Ast, start: usize, end: usize) Error!bool {
         const newline = if (newline_index) |i| comment_start + i else null;
 
         const untrimmed_comment = tree.source[comment_start .. newline orelse tree.source.len];
-        const trimmed_comment = mem.trimRight(u8, untrimmed_comment, &std.ascii.spaces);
+        const trimmed_comment = mem.trimRight(u8, untrimmed_comment, &std.ascii.whitespace);
 
         // Don't leave any whitespace at the start of the file
         if (index != 0) {
@@ -2609,7 +2666,7 @@ fn renderComments(ais: *Ais, tree: Ast, start: usize, end: usize) Error!bool {
 
         index = 1 + (newline orelse end - 1);
 
-        const comment_content = mem.trimLeft(u8, trimmed_comment["//".len..], &std.ascii.spaces);
+        const comment_content = mem.trimLeft(u8, trimmed_comment["//".len..], &std.ascii.whitespace);
         if (ais.disabled_offset != null and mem.eql(u8, comment_content, "zig fmt: on")) {
             // Write the source for which formatting was disabled directly
             // to the underlying writer, fixing up invaild whitespace.
@@ -2656,7 +2713,7 @@ fn renderExtraNewlineToken(ais: *Ais, tree: Ast, token_index: Ast.TokenIndex) Er
     // non-whitespace character is encountered or two newlines have been found.
     var i = token_start - 1;
     var newlines: u2 = 0;
-    while (std.ascii.isSpace(tree.source[i])) : (i -= 1) {
+    while (std.ascii.isWhitespace(tree.source[i])) : (i -= 1) {
         if (tree.source[i] == '\n') newlines += 1;
         if (newlines == 2) return ais.insertNewline();
         if (i == prev_token_end) break;
@@ -2718,7 +2775,7 @@ fn tokenSliceForRender(tree: Ast, token_index: Ast.TokenIndex) []const u8 {
             ret.len -= 1;
         },
         .container_doc_comment, .doc_comment => {
-            ret = mem.trimRight(u8, ret, &std.ascii.spaces);
+            ret = mem.trimRight(u8, ret, &std.ascii.whitespace);
         },
         else => {},
     }

@@ -248,8 +248,7 @@ pub fn createEmpty(gpa: Allocator, options: link.Options) !*Coff {
     };
 
     const use_llvm = build_options.have_llvm and options.use_llvm;
-    const use_stage1 = build_options.have_stage1 and options.use_stage1;
-    if (use_llvm and !use_stage1) {
+    if (use_llvm) {
         self.llvm_object = try LlvmObject.create(gpa, options);
     }
     return self;
@@ -290,6 +289,7 @@ pub fn deinit(self: *Coff) void {
 
     self.unresolved.deinit(gpa);
     self.locals_free_list.deinit(gpa);
+    self.globals_free_list.deinit(gpa);
     self.strtab.deinit(gpa);
     self.got_entries.deinit(gpa);
     self.got_entries_free_list.deinit(gpa);
@@ -938,9 +938,9 @@ pub fn updateFunc(self: *Coff, module: *Module, func: *Module.Fn, air: Air, live
 
     try self.updateDeclCode(decl_index, code, .FUNCTION);
 
-    // Since we updated the vaddr and the size, each corresponding export symbol also needs to be updated.
-    const decl_exports = module.decl_exports.get(decl_index) orelse &[0]*Module.Export{};
-    return self.updateDeclExports(module, decl_index, decl_exports);
+    // Since we updated the vaddr and the size, each corresponding export
+    // symbol also needs to be updated.
+    return self.updateDeclExports(module, decl_index, module.getDeclExports(decl_index));
 }
 
 pub fn lowerUnnamedConst(self: *Coff, tv: TypedValue, decl_index: Module.Decl.Index) !u32 {
@@ -1053,9 +1053,9 @@ pub fn updateDecl(self: *Coff, module: *Module, decl_index: Module.Decl.Index) !
 
     try self.updateDeclCode(decl_index, code, .NULL);
 
-    // Since we updated the vaddr and the size, each corresponding export symbol also needs to be updated.
-    const decl_exports = module.decl_exports.get(decl_index) orelse &[0]*Module.Export{};
-    return self.updateDeclExports(module, decl_index, decl_exports);
+    // Since we updated the vaddr and the size, each corresponding export
+    // symbol also needs to be updated.
+    return self.updateDeclExports(module, decl_index, module.getDeclExports(decl_index));
 }
 
 fn getDeclOutputSection(self: *Coff, decl: *Module.Decl) u16 {
@@ -1151,8 +1151,10 @@ fn updateDeclCode(self: *Coff, decl_index: Module.Decl.Index, code: []const u8, 
 }
 
 fn freeRelocationsForAtom(self: *Coff, atom: *Atom) void {
-    _ = self.relocs.remove(atom);
-    _ = self.base_relocs.remove(atom);
+    var removed_relocs = self.relocs.fetchRemove(atom);
+    if (removed_relocs) |*relocs| relocs.value.deinit(self.base.allocator);
+    var removed_base_relocs = self.base_relocs.fetchRemove(atom);
+    if (removed_base_relocs) |*base_relocs| base_relocs.value.deinit(self.base.allocator);
 }
 
 fn freeUnnamedConsts(self: *Coff, decl_index: Module.Decl.Index) void {
@@ -1490,9 +1492,8 @@ pub fn getGlobalSymbol(self: *Coff, name: []const u8) !u32 {
     gop.value_ptr.* = sym_loc;
 
     const gpa = self.base.allocator;
-    const sym_name = try gpa.dupe(u8, name);
     const sym = self.getSymbolPtr(sym_loc);
-    try self.setSymbolName(sym, sym_name);
+    try self.setSymbolName(sym, name);
     sym.storage_class = .EXTERNAL;
 
     try self.unresolved.putNoClobber(gpa, global_index, true);
@@ -1861,9 +1862,7 @@ fn writeHeader(self: *Coff) !void {
 }
 
 pub fn padToIdeal(actual_size: anytype) @TypeOf(actual_size) {
-    // TODO https://github.com/ziglang/zig/issues/1284
-    return math.add(@TypeOf(actual_size), actual_size, actual_size / ideal_factor) catch
-        math.maxInt(@TypeOf(actual_size));
+    return actual_size +| (actual_size / ideal_factor);
 }
 
 fn detectAllocCollision(self: *Coff, start: u32, size: u32) ?u32 {

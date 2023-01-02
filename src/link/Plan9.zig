@@ -201,7 +201,10 @@ fn putFn(self: *Plan9, decl_index: Module.Decl.Index, out: FnDeclOutput) !void {
     const decl = mod.declPtr(decl_index);
     const fn_map_res = try self.fn_decl_table.getOrPut(gpa, decl.getFileScope());
     if (fn_map_res.found_existing) {
-        try fn_map_res.value_ptr.functions.put(gpa, decl_index, out);
+        if (try fn_map_res.value_ptr.functions.fetchPut(gpa, decl_index, out)) |old_entry| {
+            gpa.free(old_entry.value.code);
+            gpa.free(old_entry.value.lineinfo);
+        }
     } else {
         const file = decl.getFileScope();
         const arena = self.path_arena.allocator();
@@ -230,7 +233,7 @@ fn putFn(self: *Plan9, decl_index: Module.Decl.Index, out: FnDeclOutput) !void {
 
         // null terminate
         try a.append(0);
-        const final = a.toOwnedSlice();
+        const final = try a.toOwnedSlice();
         self.syms.items[fn_map_res.value_ptr.sym_index - 1] = .{
             .type = .z,
             .value = 1,
@@ -296,7 +299,7 @@ pub fn updateFunc(self: *Plan9, module: *Module, func: *Module.Fn, air: Air, liv
         },
     );
     const code = switch (res) {
-        .appended => code_buffer.toOwnedSlice(),
+        .appended => try code_buffer.toOwnedSlice(),
         .fail => |em| {
             decl.analysis = .codegen_failure;
             try module.failed_decls.put(module.gpa, decl_index, em);
@@ -305,7 +308,7 @@ pub fn updateFunc(self: *Plan9, module: *Module, func: *Module.Fn, air: Air, liv
     };
     const out: FnDeclOutput = .{
         .code = code,
-        .lineinfo = dbg_line_buffer.toOwnedSlice(),
+        .lineinfo = try dbg_line_buffer.toOwnedSlice(),
         .start_line = start_line.?,
         .end_line = end_line,
     };
@@ -408,9 +411,11 @@ pub fn updateDecl(self: *Plan9, module: *Module, decl_index: Module.Decl.Index) 
             return;
         },
     };
-    var duped_code = try self.base.allocator.dupe(u8, code);
-    errdefer self.base.allocator.free(duped_code);
-    try self.data_decl_table.put(self.base.allocator, decl_index, duped_code);
+    try self.data_decl_table.ensureUnusedCapacity(self.base.allocator, 1);
+    const duped_code = try self.base.allocator.dupe(u8, code);
+    if (self.data_decl_table.fetchPutAssumeCapacity(decl_index, duped_code)) |old_entry| {
+        self.base.allocator.free(old_entry.value);
+    }
     return self.updateFinish(decl);
 }
 /// called at the end of update{Decl,Func}
@@ -574,7 +579,7 @@ pub fn flushModule(self: *Plan9, comp: *Compilation, prog_node: *std.Progress.No
                 }
                 self.syms.items[decl.link.plan9.sym_index.?].value = off;
                 if (mod.decl_exports.get(decl_index)) |exports| {
-                    try self.addDeclExports(mod, decl, exports);
+                    try self.addDeclExports(mod, decl, exports.items);
                 }
             }
         }
@@ -611,7 +616,7 @@ pub fn flushModule(self: *Plan9, comp: *Compilation, prog_node: *std.Progress.No
             }
             self.syms.items[decl.link.plan9.sym_index.?].value = off;
             if (mod.decl_exports.get(decl_index)) |exports| {
-                try self.addDeclExports(mod, decl, exports);
+                try self.addDeclExports(mod, decl, exports.items);
             }
         }
         // write the unnamed constants after the other data decls
@@ -641,7 +646,7 @@ pub fn flushModule(self: *Plan9, comp: *Compilation, prog_node: *std.Progress.No
     self.syms.items[1].value = self.getAddr(0x0, .b);
     var sym_buf = std.ArrayList(u8).init(self.base.allocator);
     try self.writeSyms(&sym_buf);
-    const syms = sym_buf.toOwnedSlice();
+    const syms = try sym_buf.toOwnedSlice();
     defer self.base.allocator.free(syms);
     assert(2 + self.atomCount() == iovecs_i); // we didn't write all the decls
     iovecs[iovecs_i] = .{ .iov_base = syms.ptr, .iov_len = syms.len };
@@ -743,14 +748,19 @@ pub fn freeDecl(self: *Plan9, decl_index: Module.Decl.Index) void {
     if (is_fn) {
         var symidx_and_submap = self.fn_decl_table.get(decl.getFileScope()).?;
         var submap = symidx_and_submap.functions;
-        _ = submap.swapRemove(decl_index);
+        if (submap.fetchSwapRemove(decl_index)) |removed_entry| {
+            self.base.allocator.free(removed_entry.value.code);
+            self.base.allocator.free(removed_entry.value.lineinfo);
+        }
         if (submap.count() == 0) {
             self.syms.items[symidx_and_submap.sym_index] = aout.Sym.undefined_symbol;
             self.syms_index_free_list.append(self.base.allocator, symidx_and_submap.sym_index) catch {};
             submap.deinit(self.base.allocator);
         }
     } else {
-        _ = self.data_decl_table.swapRemove(decl_index);
+        if (self.data_decl_table.fetchSwapRemove(decl_index)) |removed_entry| {
+            self.base.allocator.free(removed_entry.value);
+        }
     }
     if (decl.link.plan9.got_index) |i| {
         // TODO: if this catch {} is triggered, an assertion in flushModule will be triggered, because got_index_free_list will have the wrong length
@@ -914,7 +924,7 @@ pub fn writeSyms(self: *Plan9, buf: *std.ArrayList(u8)) !void {
             const sym = self.syms.items[decl.link.plan9.sym_index.?];
             try self.writeSym(writer, sym);
             if (self.base.options.module.?.decl_exports.get(decl_index)) |exports| {
-                for (exports) |e| {
+                for (exports.items) |e| {
                     try self.writeSym(writer, self.syms.items[e.link.plan9.?]);
                 }
             }
@@ -939,7 +949,7 @@ pub fn writeSyms(self: *Plan9, buf: *std.ArrayList(u8)) !void {
                 const sym = self.syms.items[decl.link.plan9.sym_index.?];
                 try self.writeSym(writer, sym);
                 if (self.base.options.module.?.decl_exports.get(decl_index)) |exports| {
-                    for (exports) |e| {
+                    for (exports.items) |e| {
                         const s = self.syms.items[e.link.plan9.?];
                         if (mem.eql(u8, s.name, "_start"))
                             self.entry_val = s.value;
