@@ -1,4 +1,4 @@
-//! This file contains the functionality for lowering AArch64 MIR into
+//! This file contains the functionality for lowering AArch32 MIR into
 //! machine code
 
 const Emit = @This();
@@ -15,7 +15,7 @@ const Target = std.Target;
 const assert = std.debug.assert;
 const Instruction = bits.Instruction;
 const Register = bits.Register;
-const log = std.log.scoped(.aarch64_emit);
+const log = std.log.scoped(.aarch32_emit);
 const DebugInfoOutput = @import("../../codegen.zig").DebugInfoOutput;
 const CodeGen = @import("CodeGen.zig");
 
@@ -77,7 +77,7 @@ pub fn emitMir(
     try emit.lowerBranches();
 
     // Emit machine code
-    for (mir_tags) |tag, index| {
+    for (mir_tags, 0..) |tag, index| {
         const inst = @intCast(u32, index);
         switch (tag) {
             .add => try emit.mirDataProcessing(inst),
@@ -100,6 +100,7 @@ pub fn emitMir(
 
             .b => try emit.mirBranch(inst),
 
+            .undefined_instruction => try emit.mirUndefinedInstruction(),
             .bkpt => try emit.mirExceptionGeneration(inst),
 
             .blx => try emit.mirBranchExchange(inst),
@@ -239,7 +240,7 @@ fn lowerBranches(emit: *Emit) !void {
     //
     // TODO optimization opportunity: do this in codegen while
     // generating MIR
-    for (mir_tags) |tag, index| {
+    for (mir_tags, 0..) |tag, index| {
         const inst = @intCast(u32, index);
         if (isBranch(tag)) {
             const target_inst = emit.branchTarget(inst);
@@ -284,7 +285,7 @@ fn lowerBranches(emit: *Emit) !void {
         all_branches_lowered = true;
         var current_code_offset: usize = 0;
 
-        for (mir_tags) |tag, index| {
+        for (mir_tags, 0..) |tag, index| {
             const inst = @intCast(u32, index);
 
             // If this instruction contained in the code offset
@@ -492,6 +493,10 @@ fn mirBranch(emit: *Emit, inst: Mir.Inst.Index) !void {
             else => unreachable,
         },
     }
+}
+
+fn mirUndefinedInstruction(emit: *Emit) !void {
+    try emit.writeInstruction(Instruction.undefinedInstruction());
 }
 
 fn mirExceptionGeneration(emit: *Emit, inst: Mir.Inst.Index) !void {

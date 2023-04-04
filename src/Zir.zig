@@ -100,8 +100,7 @@ pub fn nullTerminatedString(code: Zir, index: usize) [:0]const u8 {
 
 pub fn refSlice(code: Zir, start: usize, len: usize) []Inst.Ref {
     const raw_slice = code.extra[start..][0..len];
-    // TODO we should be able to directly `@ptrCast` the slice to the other slice type.
-    return @ptrCast([*]Inst.Ref, raw_slice.ptr)[0..len];
+    return @ptrCast([]Inst.Ref, raw_slice);
 }
 
 pub fn hasCompileErrors(code: Zir) bool {
@@ -138,6 +137,8 @@ pub const Inst = struct {
         /// Saturating addition.
         /// Uses the `pl_node` union field. Payload is `Bin`.
         add_sat,
+        /// The same as `add` except no safety check.
+        add_unsafe,
         /// Arithmetic subtraction. Asserts no integer overflow.
         /// Uses the `pl_node` union field. Payload is `Bin`.
         sub,
@@ -383,18 +384,24 @@ pub const Inst = struct {
         /// Uses the `pl_node` union field. AST node is a[b] syntax. Payload is `Bin`.
         elem_ptr_node,
         /// Same as `elem_ptr_node` but used only for for loop.
-        /// Uses the `pl_node` union field. AST node is the condition of a for loop. Payload is `Bin`.
+        /// Uses the `pl_node` union field. AST node is the condition of a for loop.
+        /// Payload is `Bin`.
+        /// No OOB safety check is emitted.
         elem_ptr,
         /// Same as `elem_ptr_node` except the index is stored immediately rather than
         /// as a reference to another ZIR instruction.
         /// Uses the `pl_node` union field. AST node is an element inside array initialization
         /// syntax. Payload is `ElemPtrImm`.
+        /// This instruction has a way to set the result type to be a
+        /// single-pointer or a many-pointer.
         elem_ptr_imm,
         /// Given an array, slice, or pointer, returns the element at the provided index.
         /// Uses the `pl_node` union field. AST node is a[b] syntax. Payload is `Bin`.
         elem_val_node,
         /// Same as `elem_val_node` but used only for for loop.
-        /// Uses the `pl_node` union field. AST node is the condition of a for loop. Payload is `Bin`.
+        /// Uses the `pl_node` union field. AST node is the condition of a for loop.
+        /// Payload is `Bin`.
+        /// No OOB safety check is emitted.
         elem_val,
         /// Emits a compile error if the operand is not `void`.
         /// Uses the `un_node` field.
@@ -482,6 +489,9 @@ pub const Inst = struct {
         /// Return a boolean false if dereferenced pointer is an error
         /// Uses the `un_node` field.
         is_non_err_ptr,
+        /// Same as `is_non_er` but doesn't validate that the type can be an error.
+        /// Uses the `un_node` field.
+        ret_is_non_err,
         /// A labeled block of code that loops forever. At the end of the body will have either
         /// a `repeat` instruction or a `repeat_inline` instruction.
         /// Uses the `pl_node` field. The AST node is either a for loop or while loop.
@@ -495,6 +505,15 @@ pub const Inst = struct {
         /// Sends comptime control flow back to the beginning of the current block.
         /// Uses the `node` field.
         repeat_inline,
+        /// Asserts that all the lengths provided match. Used to build a for loop.
+        /// Return value is the length as a usize.
+        /// Uses the `pl_node` field with payload `MultiOp`.
+        /// There is exactly one item corresponding to each AST node inside the for
+        /// loop condition. Any item may be `none`, indicating an unbounded range.
+        /// Illegal behaviors:
+        ///  * If all lengths are unbounded ranges (always a compile error).
+        ///  * If any two lengths do not match each other.
+        for_len,
         /// Merge two error sets into one, `E1 || E2`.
         /// Uses the `pl_node` field with payload `Bin`.
         merge_error_sets,
@@ -598,7 +617,7 @@ pub const Inst = struct {
         /// Uses the `un_node` field.
         typeof_log2_int_type,
         /// Asserts control-flow will not reach this instruction (`unreachable`).
-        /// Uses the `unreachable` union field.
+        /// Uses the `@"unreachable"` union field.
         @"unreachable",
         /// Bitwise XOR. `^`
         /// Uses the `pl_node` union field. Payload is `Bin`.
@@ -789,8 +808,9 @@ pub const Inst = struct {
         panic,
         /// Same as `panic` but forces comptime.
         panic_comptime,
-        /// Implement builtin `@setCold`. Uses `un_node`.
-        set_cold,
+        /// Implements `@trap`.
+        /// Uses the `node` field.
+        trap,
         /// Implement builtin `@setRuntimeSafety`. Uses `un_node`.
         set_runtime_safety,
         /// Implement builtin `@sqrt`. Uses `un_node`.
@@ -1006,6 +1026,7 @@ pub const Inst = struct {
                 .add,
                 .addwrap,
                 .add_sat,
+                .add_unsafe,
                 .alloc,
                 .alloc_mut,
                 .alloc_comptime_mut,
@@ -1084,6 +1105,7 @@ pub const Inst = struct {
                 .is_non_null_ptr,
                 .is_non_err,
                 .is_non_err_ptr,
+                .ret_is_non_err,
                 .mod_rem,
                 .mul,
                 .mulwrap,
@@ -1166,7 +1188,6 @@ pub const Inst = struct {
                 .bool_to_int,
                 .embed_file,
                 .error_name,
-                .set_cold,
                 .set_runtime_safety,
                 .sqrt,
                 .sin,
@@ -1239,6 +1260,7 @@ pub const Inst = struct {
                 .defer_err_code,
                 .save_err_ret_index,
                 .restore_err_ret_index,
+                .for_len,
                 => false,
 
                 .@"break",
@@ -1255,6 +1277,7 @@ pub const Inst = struct {
                 .repeat_inline,
                 .panic,
                 .panic_comptime,
+                .trap,
                 .check_comptime_control_flow,
                 => true,
             };
@@ -1301,7 +1324,6 @@ pub const Inst = struct {
                 .validate_deref,
                 .@"export",
                 .export_value,
-                .set_cold,
                 .set_runtime_safety,
                 .memcpy,
                 .memset,
@@ -1319,6 +1341,7 @@ pub const Inst = struct {
                 .add,
                 .addwrap,
                 .add_sat,
+                .add_unsafe,
                 .alloc,
                 .alloc_mut,
                 .alloc_comptime_mut,
@@ -1387,6 +1410,7 @@ pub const Inst = struct {
                 .is_non_null_ptr,
                 .is_non_err,
                 .is_non_err_ptr,
+                .ret_is_non_err,
                 .mod_rem,
                 .mul,
                 .mulwrap,
@@ -1529,6 +1553,8 @@ pub const Inst = struct {
                 .repeat_inline,
                 .panic,
                 .panic_comptime,
+                .trap,
+                .for_len,
                 .@"try",
                 .try_ptr,
                 //.try_inline,
@@ -1536,7 +1562,7 @@ pub const Inst = struct {
                 => false,
 
                 .extended => switch (data.extended.opcode) {
-                    .breakpoint, .fence => true,
+                    .fence, .set_cold, .breakpoint => true,
                     else => false,
                 },
             };
@@ -1549,6 +1575,7 @@ pub const Inst = struct {
                 .add = .pl_node,
                 .addwrap = .pl_node,
                 .add_sat = .pl_node,
+                .add_unsafe = .pl_node,
                 .sub = .pl_node,
                 .subwrap = .pl_node,
                 .sub_sat = .pl_node,
@@ -1584,6 +1611,7 @@ pub const Inst = struct {
                 .@"break" = .@"break",
                 .break_inline = .@"break",
                 .check_comptime_control_flow = .un_node,
+                .for_len = .pl_node,
                 .call = .pl_node,
                 .cmp_lt = .pl_node,
                 .cmp_lte = .pl_node,
@@ -1641,6 +1669,7 @@ pub const Inst = struct {
                 .is_non_null_ptr = .un_node,
                 .is_non_err = .un_node,
                 .is_non_err_ptr = .un_node,
+                .ret_is_non_err = .un_node,
                 .loop = .pl_node,
                 .repeat = .node,
                 .repeat_inline = .node,
@@ -1722,7 +1751,7 @@ pub const Inst = struct {
                 .error_name = .un_node,
                 .panic = .un_node,
                 .panic_comptime = .un_node,
-                .set_cold = .un_node,
+                .trap = .node,
                 .set_runtime_safety = .un_node,
                 .sqrt = .un_node,
                 .sin = .un_node,
@@ -1951,11 +1980,15 @@ pub const Inst = struct {
         /// Implement builtin `@setAlignStack`.
         /// `operand` is payload index to `UnNode`.
         set_align_stack,
+        /// Implements `@setCold`.
+        /// `operand` is payload index to `UnNode`.
+        set_cold,
         /// Implements the `@errSetCast` builtin.
         /// `operand` is payload index to `BinNode`. `lhs` is dest type, `rhs` is operand.
         err_set_cast,
         /// `operand` is payload index to `UnNode`.
         await_nosuspend,
+        /// Implements `@breakpoint`.
         /// `operand` is `src_node: i32`.
         breakpoint,
         /// Implements the `@select` builtin.
@@ -1969,7 +2002,7 @@ pub const Inst = struct {
         int_to_error,
         /// Implement builtin `@Type`.
         /// `operand` is payload index to `UnNode`.
-        /// `small` contains `NameStrategy
+        /// `small` contains `NameStrategy`.
         reify,
         /// Implements the `@asyncCall` builtin.
         /// `operand` is payload index to `AsyncCall`.
@@ -1993,6 +2026,21 @@ pub const Inst = struct {
         /// Implement builtin `@cVaStart`.
         /// `operand` is `src_node: i32`.
         c_va_start,
+        /// Implements the `@constCast` builtin.
+        /// `operand` is payload index to `UnNode`.
+        const_cast,
+        /// Implements the `@volatileCast` builtin.
+        /// `operand` is payload index to `UnNode`.
+        volatile_cast,
+        /// Implements the `@workItemId` builtin.
+        /// `operand` is payload index to `UnNode`.
+        work_item_id,
+        /// Implements the `@workGroupSize` builtin.
+        /// `operand` is payload index to `UnNode`.
+        work_group_size,
+        /// Implements the `@workGroupId` builtin.
+        /// `operand` is payload index to `UnNode`.
+        work_group_id,
 
         pub const InstData = struct {
             opcode: Extended,
@@ -2006,8 +2054,7 @@ pub const Inst = struct {
 
     /// A reference to a TypedValue or ZIR instruction.
     ///
-    /// If the Ref has a tag in this enum, it refers to a TypedValue which may be
-    /// retrieved with Ref.toTypedValue().
+    /// If the Ref has a tag in this enum, it refers to a TypedValue.
     ///
     /// If the value of a Ref does not have a tag, it refers to a ZIR instruction.
     ///
@@ -2565,8 +2612,8 @@ pub const Inst = struct {
             }
         },
         @"break": struct {
-            block_inst: Index,
             operand: Ref,
+            payload_index: u32,
         },
         switch_capture: struct {
             switch_inst: Index,
@@ -2650,6 +2697,13 @@ pub const Inst = struct {
             save_err_ret_index,
             restore_err_ret_index,
         };
+    };
+
+    pub const Break = struct {
+        pub const no_src_node = std.math.maxInt(i32);
+
+        block_inst: Index,
+        operand_src_node: i32,
     };
 
     /// Trailing:
@@ -3556,6 +3610,12 @@ pub const Inst = struct {
             /// 0 or a payload index of a `Block`, each is a payload
             /// index of another `Item`.
             notes: u32,
+
+            pub fn notesLen(item: Item, zir: Zir) u32 {
+                if (item.notes == 0) return 0;
+                const block = zir.extraData(Block, item.notes);
+                return block.data.body_len;
+            }
         };
     };
 

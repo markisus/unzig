@@ -138,7 +138,6 @@ test "pointer to type" {
 }
 
 test "a type constructed in a global expression" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -317,7 +316,7 @@ test "create global array with for loop" {
 
 const global_array = x: {
     var result: [10]usize = undefined;
-    for (result) |*item, index| {
+    for (&result, 0..) |*item, index| {
         item.* = index * index;
     }
     break :x result;
@@ -447,7 +446,7 @@ test "binary math operator in partially inlined function" {
     var s: [4]u32 = undefined;
     var b: [16]u8 = undefined;
 
-    for (b) |*r, i|
+    for (&b, 0..) |*r, i|
         r.* = @intCast(u8, i + 1);
 
     copyWithPartialInline(s[0..], b[0..]);
@@ -459,7 +458,6 @@ test "binary math operator in partially inlined function" {
 
 test "comptime shl" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -915,7 +913,7 @@ test "comptime pointer load through elem_ptr" {
 
     comptime {
         var array: [10]S = undefined;
-        for (array) |*elem, i| {
+        for (&array, 0..) |*elem, i| {
             elem.* = .{
                 .x = i,
             };
@@ -1338,6 +1336,7 @@ test "lazy sizeof is resolved in division" {
 
 test "lazy value is resolved as slice operand" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const A = struct { a: u32 };
@@ -1514,7 +1513,6 @@ test "x or true is comptime-known true" {
 }
 
 test "non-optional and optional array elements concatenated" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO

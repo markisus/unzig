@@ -28,8 +28,11 @@ pub const user32 = @import("windows/user32.zig");
 pub const ws2_32 = @import("windows/ws2_32.zig");
 pub const gdi32 = @import("windows/gdi32.zig");
 pub const winmm = @import("windows/winmm.zig");
+pub const crypt32 = @import("windows/crypt32.zig");
 
 pub const self_process_handle = @intToPtr(HANDLE, maxInt(usize));
+
+const Self = @This();
 
 pub const OpenError = error{
     IsDir,
@@ -82,7 +85,7 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
     var nt_name = UNICODE_STRING{
         .Length = path_len_bytes,
         .MaximumLength = path_len_bytes,
-        .Buffer = @intToPtr([*]u16, @ptrToInt(sub_path_w.ptr)),
+        .Buffer = @constCast(sub_path_w.ptr),
     };
     var attr = OBJECT_ATTRIBUTES{
         .Length = @sizeOf(OBJECT_ATTRIBUTES),
@@ -102,41 +105,53 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
     // If we're not following symlinks, we need to ensure we don't pass in any synchronization flags such as FILE_SYNCHRONOUS_IO_NONALERT.
     const flags: ULONG = if (options.follow_symlinks) file_or_dir_flag | blocking_flag else file_or_dir_flag | FILE_OPEN_REPARSE_POINT;
 
-    const rc = ntdll.NtCreateFile(
-        &result,
-        options.access_mask,
-        &attr,
-        &io,
-        null,
-        FILE_ATTRIBUTE_NORMAL,
-        options.share_access,
-        options.creation,
-        flags,
-        null,
-        0,
-    );
-    switch (rc) {
-        .SUCCESS => {
-            if (std.io.is_async and options.io_mode == .evented) {
-                _ = CreateIoCompletionPort(result, std.event.Loop.instance.?.os_data.io_port, undefined, undefined) catch undefined;
-            }
-            return result;
-        },
-        .OBJECT_NAME_INVALID => unreachable,
-        .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
-        .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
-        .NO_MEDIA_IN_DEVICE => return error.NoDevice,
-        .INVALID_PARAMETER => unreachable,
-        .SHARING_VIOLATION => return error.AccessDenied,
-        .ACCESS_DENIED => return error.AccessDenied,
-        .PIPE_BUSY => return error.PipeBusy,
-        .OBJECT_PATH_SYNTAX_BAD => unreachable,
-        .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
-        .FILE_IS_A_DIRECTORY => return error.IsDir,
-        .NOT_A_DIRECTORY => return error.NotDir,
-        .USER_MAPPED_FILE => return error.AccessDenied,
-        .INVALID_HANDLE => unreachable,
-        else => return unexpectedStatus(rc),
+    while (true) {
+        const rc = ntdll.NtCreateFile(
+            &result,
+            options.access_mask,
+            &attr,
+            &io,
+            null,
+            FILE_ATTRIBUTE_NORMAL,
+            options.share_access,
+            options.creation,
+            flags,
+            null,
+            0,
+        );
+        switch (rc) {
+            .SUCCESS => {
+                if (std.io.is_async and options.io_mode == .evented) {
+                    _ = CreateIoCompletionPort(result, std.event.Loop.instance.?.os_data.io_port, undefined, undefined) catch undefined;
+                }
+                return result;
+            },
+            .OBJECT_NAME_INVALID => unreachable,
+            .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
+            .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
+            .NO_MEDIA_IN_DEVICE => return error.NoDevice,
+            .INVALID_PARAMETER => unreachable,
+            .SHARING_VIOLATION => return error.AccessDenied,
+            .ACCESS_DENIED => return error.AccessDenied,
+            .PIPE_BUSY => return error.PipeBusy,
+            .OBJECT_PATH_SYNTAX_BAD => unreachable,
+            .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
+            .FILE_IS_A_DIRECTORY => return error.IsDir,
+            .NOT_A_DIRECTORY => return error.NotDir,
+            .USER_MAPPED_FILE => return error.AccessDenied,
+            .INVALID_HANDLE => unreachable,
+            .DELETE_PENDING => {
+                // This error means that there *was* a file in this location on
+                // the file system, but it was deleted. However, the OS is not
+                // finished with the deletion operation, and so this CreateFile
+                // call has failed. There is not really a sane way to handle
+                // this other than retrying the creation after the OS finishes
+                // the deletion.
+                std.time.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            else => return unexpectedStatus(rc),
+        }
     }
 }
 
@@ -432,8 +447,9 @@ pub fn FindClose(hFindFile: HANDLE) void {
 }
 
 pub const ReadFileError = error{
-    OperationAborted,
     BrokenPipe,
+    NetNameDeleted,
+    OperationAborted,
     Unexpected,
 };
 
@@ -472,6 +488,7 @@ pub fn ReadFile(in_hFile: HANDLE, buffer: []u8, offset: ?u64, io_mode: std.io.Mo
                 .IO_PENDING => unreachable,
                 .OPERATION_ABORTED => return error.OperationAborted,
                 .BROKEN_PIPE => return error.BrokenPipe,
+                .NETNAME_DELETED => return error.NetNameDeleted,
                 .HANDLE_EOF => return @as(usize, bytes_transferred),
                 else => |err| return unexpectedError(err),
             }
@@ -503,9 +520,11 @@ pub fn ReadFile(in_hFile: HANDLE, buffer: []u8, offset: ?u64, io_mode: std.io.Mo
             } else null;
             if (kernel32.ReadFile(in_hFile, buffer.ptr, want_read_count, &amt_read, overlapped) == 0) {
                 switch (kernel32.GetLastError()) {
+                    .IO_PENDING => unreachable,
                     .OPERATION_ABORTED => continue,
                     .BROKEN_PIPE => return 0,
                     .HANDLE_EOF => return 0,
+                    .NETNAME_DELETED => return error.NetNameDeleted,
                     else => |err| return unexpectedError(err),
                 }
             }
@@ -627,7 +646,7 @@ pub fn SetCurrentDirectory(path_name: []const u16) SetCurrentDirectoryError!void
     var nt_name = UNICODE_STRING{
         .Length = path_len_bytes,
         .MaximumLength = path_len_bytes,
-        .Buffer = @intToPtr([*]u16, @ptrToInt(path_name.ptr)),
+        .Buffer = @constCast(path_name.ptr),
     };
 
     const rc = ntdll.RtlSetCurrentDirectory_U(&nt_name);
@@ -759,7 +778,7 @@ pub fn ReadLink(dir: ?HANDLE, sub_path_w: []const u16, out_buffer: []u8) ReadLin
     var nt_name = UNICODE_STRING{
         .Length = path_len_bytes,
         .MaximumLength = path_len_bytes,
-        .Buffer = @intToPtr([*]u16, @ptrToInt(sub_path_w.ptr)),
+        .Buffer = @constCast(sub_path_w.ptr),
     };
     var attr = OBJECT_ATTRIBUTES{
         .Length = @sizeOf(OBJECT_ATTRIBUTES),
@@ -869,7 +888,7 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
         .Length = path_len_bytes,
         .MaximumLength = path_len_bytes,
         // The Windows API makes this mutable, but it will not mutate here.
-        .Buffer = @intToPtr([*]u16, @ptrToInt(sub_path_w.ptr)),
+        .Buffer = @constCast(sub_path_w.ptr),
     };
 
     if (sub_path_w[0] == '.' and sub_path_w[1] == 0) {
@@ -1211,23 +1230,6 @@ test "GetFinalPathNameByHandle" {
     _ = try GetFinalPathNameByHandle(handle, .{ .volume_name = .Dos }, buffer[0..required_len_in_u16]);
 }
 
-pub const QueryInformationFileError = error{Unexpected};
-
-pub fn QueryInformationFile(
-    handle: HANDLE,
-    info_class: FILE_INFORMATION_CLASS,
-    out_buffer: []u8,
-) QueryInformationFileError!void {
-    var io: IO_STATUS_BLOCK = undefined;
-    const len_bytes = std.math.cast(u32, out_buffer.len) orelse unreachable;
-    const rc = ntdll.NtQueryInformationFile(handle, &io, out_buffer.ptr, len_bytes, info_class);
-    switch (rc) {
-        .SUCCESS => {},
-        .INVALID_PARAMETER => unreachable,
-        else => return unexpectedStatus(rc),
-    }
-}
-
 pub const GetFileSizeError = error{Unexpected};
 
 pub fn GetFileSizeEx(hFile: HANDLE) GetFileSizeError!u64 {
@@ -1293,6 +1295,23 @@ pub fn WSACleanup() !void {
 
 var wsa_startup_mutex: std.Thread.Mutex = .{};
 
+pub fn callWSAStartup() !void {
+    wsa_startup_mutex.lock();
+    defer wsa_startup_mutex.unlock();
+
+    // Here we could use a flag to prevent multiple threads to prevent
+    // multiple calls to WSAStartup, but it doesn't matter. We're globally
+    // leaking the resource intentionally, and the mutex already prevents
+    // data races within the WSAStartup function.
+    _ = WSAStartup(2, 2) catch |err| switch (err) {
+        error.SystemNotAvailable => return error.SystemResources,
+        error.VersionNotSupported => return error.Unexpected,
+        error.BlockingOperationInProgress => return error.Unexpected,
+        error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
+        error.Unexpected => return error.Unexpected,
+    };
+}
+
 /// Microsoft requires WSAStartup to be called to initialize, or else
 /// WSASocketW will return WSANOTINITIALISED.
 /// Since this is a standard library, we do not have the luxury of
@@ -1335,21 +1354,7 @@ pub fn WSASocketW(
                 .WSANOTINITIALISED => {
                     if (!first) return error.Unexpected;
                     first = false;
-
-                    wsa_startup_mutex.lock();
-                    defer wsa_startup_mutex.unlock();
-
-                    // Here we could use a flag to prevent multiple threads to prevent
-                    // multiple calls to WSAStartup, but it doesn't matter. We're globally
-                    // leaking the resource intentionally, and the mutex already prevents
-                    // data races within the WSAStartup function.
-                    _ = WSAStartup(2, 2) catch |err| switch (err) {
-                        error.SystemNotAvailable => return error.SystemResources,
-                        error.VersionNotSupported => return error.Unexpected,
-                        error.BlockingOperationInProgress => return error.Unexpected,
-                        error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
-                        error.Unexpected => return error.Unexpected,
-                    };
+                    try callWSAStartup();
                     continue;
                 },
                 else => |err| return unexpectedWSAError(err),
@@ -1404,7 +1409,7 @@ pub fn sendmsg(
 }
 
 pub fn sendto(s: ws2_32.SOCKET, buf: [*]const u8, len: usize, flags: u32, to: ?*const ws2_32.sockaddr, to_len: ws2_32.socklen_t) i32 {
-    var buffer = ws2_32.WSABUF{ .len = @truncate(u31, len), .buf = @intToPtr([*]u8, @ptrToInt(buf)) };
+    var buffer = ws2_32.WSABUF{ .len = @truncate(u31, len), .buf = @constCast(buf) };
     var bytes_send: DWORD = undefined;
     if (ws2_32.WSASendTo(s, @ptrCast([*]ws2_32.WSABUF, &buffer), 1, &bytes_send, flags, to, @intCast(i32, to_len), null, null) == ws2_32.SOCKET_ERROR) {
         return ws2_32.SOCKET_ERROR;
@@ -1491,6 +1496,40 @@ pub fn VirtualAlloc(addr: ?LPVOID, size: usize, alloc_type: DWORD, flProtect: DW
 
 pub fn VirtualFree(lpAddress: ?LPVOID, dwSize: usize, dwFreeType: DWORD) void {
     assert(kernel32.VirtualFree(lpAddress, dwSize, dwFreeType) != 0);
+}
+
+pub const VirtualProtectError = error{
+    InvalidAddress,
+    Unexpected,
+};
+
+pub fn VirtualProtect(lpAddress: ?LPVOID, dwSize: SIZE_T, flNewProtect: DWORD, lpflOldProtect: *DWORD) VirtualProtectError!void {
+    // ntdll takes an extra level of indirection here
+    var addr = lpAddress;
+    var size = dwSize;
+    switch (ntdll.NtProtectVirtualMemory(self_process_handle, &addr, &size, flNewProtect, lpflOldProtect)) {
+        .SUCCESS => {},
+        .INVALID_ADDRESS => return error.InvalidAddress,
+        else => |st| return unexpectedStatus(st),
+    }
+}
+
+pub fn VirtualProtectEx(handle: HANDLE, addr: ?LPVOID, size: SIZE_T, new_prot: DWORD) VirtualProtectError!DWORD {
+    var old_prot: DWORD = undefined;
+    var out_addr = addr;
+    var out_size = size;
+    switch (ntdll.NtProtectVirtualMemory(
+        handle,
+        &out_addr,
+        &out_size,
+        new_prot,
+        &old_prot,
+    )) {
+        .SUCCESS => return old_prot,
+        .INVALID_ADDRESS => return error.InvalidAddress,
+        // TODO: map errors
+        else => |rc| return std.os.windows.unexpectedStatus(rc),
+    }
 }
 
 pub const VirtualQueryError = error{Unexpected};
@@ -1687,21 +1726,6 @@ pub fn LocalFree(hMem: HLOCAL) void {
     assert(kernel32.LocalFree(hMem) == null);
 }
 
-pub const GetFileInformationByHandleError = error{Unexpected};
-
-pub fn GetFileInformationByHandle(
-    hFile: HANDLE,
-) GetFileInformationByHandleError!BY_HANDLE_FILE_INFORMATION {
-    var info: BY_HANDLE_FILE_INFORMATION = undefined;
-    const rc = ntdll.GetFileInformationByHandle(hFile, &info);
-    if (rc == 0) {
-        switch (kernel32.GetLastError()) {
-            else => |err| return unexpectedError(err),
-        }
-    }
-    return info;
-}
-
 pub const SetFileTimeError = error{Unexpected};
 
 pub fn SetFileTime(
@@ -1776,16 +1800,33 @@ pub fn UnlockFile(
     }
 }
 
+/// This is a workaround for the C backend until zig has the ability to put
+/// C code in inline assembly.
+extern fn zig_x86_windows_teb() callconv(.C) *anyopaque;
+extern fn zig_x86_64_windows_teb() callconv(.C) *anyopaque;
+
 pub fn teb() *TEB {
     return switch (native_arch) {
-        .x86 => asm volatile (
-            \\ movl %%fs:0x18, %[ptr]
-            : [ptr] "=r" (-> *TEB),
-        ),
-        .x86_64 => asm volatile (
-            \\ movq %%gs:0x30, %[ptr]
-            : [ptr] "=r" (-> *TEB),
-        ),
+        .x86 => blk: {
+            if (builtin.zig_backend == .stage2_c) {
+                break :blk @ptrCast(*TEB, @alignCast(@alignOf(TEB), zig_x86_windows_teb()));
+            } else {
+                break :blk asm volatile (
+                    \\ movl %%fs:0x18, %[ptr]
+                    : [ptr] "=r" (-> *TEB),
+                );
+            }
+        },
+        .x86_64 => blk: {
+            if (builtin.zig_backend == .stage2_c) {
+                break :blk @ptrCast(*TEB, @alignCast(@alignOf(TEB), zig_x86_64_windows_teb()));
+            } else {
+                break :blk asm volatile (
+                    \\ movq %%gs:0x30, %[ptr]
+                    : [ptr] "=r" (-> *TEB),
+                );
+            }
+        },
         .aarch64 => asm volatile (
             \\ mov %[ptr], x18
             : [ptr] "=r" (-> *TEB),
@@ -1833,13 +1874,13 @@ pub fn eqlIgnoreCaseWTF16(a: []const u16, b: []const u16) bool {
     const a_string = UNICODE_STRING{
         .Length = a_bytes,
         .MaximumLength = a_bytes,
-        .Buffer = @intToPtr([*]u16, @ptrToInt(a.ptr)),
+        .Buffer = @constCast(a.ptr),
     };
     const b_bytes = @intCast(u16, b.len * 2);
     const b_string = UNICODE_STRING{
         .Length = b_bytes,
         .MaximumLength = b_bytes,
-        .Buffer = @intToPtr([*]u16, @ptrToInt(b.ptr)),
+        .Buffer = @constCast(b.ptr),
     };
     return ntdll.RtlEqualUnicodeString(&a_string, &b_string, TRUE) == TRUE;
 }
@@ -1974,7 +2015,7 @@ pub fn sliceToPrefixedFileW(s: []const u8) !PathSpace {
 }
 
 fn getFullPathNameW(path: [*:0]const u16, out: []u16) !usize {
-    const result = kernel32.GetFullPathNameW(path, @intCast(u32, out.len), std.meta.assumeSentinel(out.ptr, 0), null);
+    const result = kernel32.GetFullPathNameW(path, @intCast(u32, out.len), out.ptr, null);
     if (result == 0) {
         switch (kernel32.GetLastError()) {
             else => |err| return unexpectedError(err),
@@ -2025,7 +2066,7 @@ pub fn loadWinsockExtensionFunction(comptime T: type, sock: ws2_32.SOCKET, guid:
         ws2_32.SIO_GET_EXTENSION_FUNCTION_POINTER,
         @ptrCast(*const anyopaque, &guid),
         @sizeOf(GUID),
-        @intToPtr(?*anyopaque, @ptrToInt(function)),
+        @intToPtr(?*anyopaque, @ptrToInt(&function)),
         @sizeOf(T),
         &num_bytes,
         null,
@@ -2065,7 +2106,7 @@ pub fn unexpectedError(err: Win32Error) std.os.UnexpectedError {
         );
         _ = std.unicode.utf16leToUtf8(&buf_utf8, buf_wstr[0..len]) catch unreachable;
         std.debug.print("error.Unexpected: GetLastError({}): {s}\n", .{ @enumToInt(err), buf_utf8[0..len] });
-        std.debug.dumpCurrentStackTrace(null);
+        std.debug.dumpCurrentStackTrace(@returnAddress());
     }
     return error.Unexpected;
 }
@@ -2079,7 +2120,7 @@ pub fn unexpectedWSAError(err: ws2_32.WinsockError) std.os.UnexpectedError {
 pub fn unexpectedStatus(status: NTSTATUS) std.os.UnexpectedError {
     if (std.os.unexpected_error_tracing) {
         std.debug.print("error.Unexpected NTSTATUS=0x{x}\n", .{@enumToInt(status)});
-        std.debug.dumpCurrentStackTrace(null);
+        std.debug.dumpCurrentStackTrace(@returnAddress());
     }
     return error.Unexpected;
 }
@@ -2427,6 +2468,29 @@ pub const FILE_INFORMATION_CLASS = enum(c_int) {
     FileStorageReserveIdInformation,
     FileCaseSensitiveInformationForceAccessCheck,
     FileMaximumInformation,
+};
+
+pub const FILE_FS_DEVICE_INFORMATION = extern struct {
+    DeviceType: DEVICE_TYPE,
+    Characteristics: ULONG,
+};
+
+pub const FS_INFORMATION_CLASS = enum(c_int) {
+    FileFsVolumeInformation = 1,
+    FileFsLabelInformation,
+    FileFsSizeInformation,
+    FileFsDeviceInformation,
+    FileFsAttributeInformation,
+    FileFsControlInformation,
+    FileFsFullSizeInformation,
+    FileFsObjectIdInformation,
+    FileFsDriverPathInformation,
+    FileFsVolumeFlagsInformation,
+    FileFsSectorSizeInformation,
+    FileFsDataCopyInformation,
+    FileFsMetadataSizeInformation,
+    FileFsFullSizeInformationEx,
+    FileFsMaximumInformation,
 };
 
 pub const OVERLAPPED = extern struct {
@@ -2815,7 +2879,7 @@ pub const GUID = extern struct {
         assert(s[18] == '-');
         assert(s[23] == '-');
         var bytes: [16]u8 = undefined;
-        for (hex_offsets) |hex_offset, i| {
+        for (hex_offsets, 0..) |hex_offset, i| {
             bytes[i] = (try std.fmt.charToDigit(s[hex_offset], 16)) << 4 |
                 try std.fmt.charToDigit(s[hex_offset + 1], 16);
         }
@@ -3272,7 +3336,7 @@ pub usingnamespace switch (native_arch) {
         };
 
         pub const CONTEXT = extern struct {
-            P1Home: DWORD64,
+            P1Home: DWORD64 align(16),
             P2Home: DWORD64,
             P3Home: DWORD64,
             P4Home: DWORD64,
@@ -3342,9 +3406,28 @@ pub usingnamespace switch (native_arch) {
             LastExceptionToRip: DWORD64,
             LastExceptionFromRip: DWORD64,
 
-            pub fn getRegs(ctx: *const CONTEXT) struct { bp: usize, ip: usize } {
-                return .{ .bp = ctx.Rbp, .ip = ctx.Rip };
+            pub fn getRegs(ctx: *const CONTEXT) struct { bp: usize, ip: usize, sp: usize } {
+                return .{ .bp = ctx.Rbp, .ip = ctx.Rip, .sp = ctx.Rsp };
             }
+
+            pub fn setIp(ctx: *CONTEXT, ip: usize) void {
+                ctx.Rip = ip;
+            }
+
+            pub fn setSp(ctx: *CONTEXT, sp: usize) void {
+                ctx.Rsp = sp;
+            }
+        };
+
+        pub const RUNTIME_FUNCTION = extern struct {
+            BeginAddress: DWORD,
+            EndAddress: DWORD,
+            UnwindData: DWORD,
+        };
+
+        pub const KNONVOLATILE_CONTEXT_POINTERS = extern struct {
+            FloatingContext: [16]?*M128A,
+            IntegerContext: [16]?*ULONG64,
         };
     },
     .aarch64 => struct {
@@ -3360,7 +3443,7 @@ pub usingnamespace switch (native_arch) {
         };
 
         pub const CONTEXT = extern struct {
-            ContextFlags: ULONG,
+            ContextFlags: ULONG align(16),
             Cpsr: ULONG,
             DUMMYUNIONNAME: extern union {
                 DUMMYSTRUCTNAME: extern struct {
@@ -3408,12 +3491,60 @@ pub usingnamespace switch (native_arch) {
             Wcr: [2]DWORD,
             Wvr: [2]DWORD64,
 
-            pub fn getRegs(ctx: *const CONTEXT) struct { bp: usize, ip: usize } {
+            pub fn getRegs(ctx: *const CONTEXT) struct { bp: usize, ip: usize, sp: usize } {
                 return .{
                     .bp = ctx.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Fp,
                     .ip = ctx.Pc,
+                    .sp = ctx.Sp,
                 };
             }
+
+            pub fn setIp(ctx: *CONTEXT, ip: usize) void {
+                ctx.Pc = ip;
+            }
+
+            pub fn setSp(ctx: *CONTEXT, sp: usize) void {
+                ctx.Sp = sp;
+            }
+        };
+
+        pub const RUNTIME_FUNCTION = extern struct {
+            BeginAddress: DWORD,
+            DUMMYUNIONNAME: extern union {
+                UnwindData: DWORD,
+                DUMMYSTRUCTNAME: packed struct {
+                    Flag: u2,
+                    FunctionLength: u11,
+                    RegF: u3,
+                    RegI: u4,
+                    H: u1,
+                    CR: u2,
+                    FrameSize: u9,
+                },
+            },
+        };
+
+        pub const KNONVOLATILE_CONTEXT_POINTERS = extern struct {
+            X19: ?*DWORD64,
+            X20: ?*DWORD64,
+            X21: ?*DWORD64,
+            X22: ?*DWORD64,
+            X23: ?*DWORD64,
+            X24: ?*DWORD64,
+            X25: ?*DWORD64,
+            X26: ?*DWORD64,
+            X27: ?*DWORD64,
+            X28: ?*DWORD64,
+            Fp: ?*DWORD64,
+            Lr: ?*DWORD64,
+            D8: ?*DWORD64,
+            D9: ?*DWORD64,
+            D10: ?*DWORD64,
+            D11: ?*DWORD64,
+            D12: ?*DWORD64,
+            D13: ?*DWORD64,
+            D14: ?*DWORD64,
+            D15: ?*DWORD64,
         };
     },
     else => struct {},
@@ -3425,6 +3556,36 @@ pub const EXCEPTION_POINTERS = extern struct {
 };
 
 pub const VECTORED_EXCEPTION_HANDLER = *const fn (ExceptionInfo: *EXCEPTION_POINTERS) callconv(WINAPI) c_long;
+
+pub const EXCEPTION_DISPOSITION = i32;
+pub const EXCEPTION_ROUTINE = *const fn (
+    ExceptionRecord: ?*EXCEPTION_RECORD,
+    EstablisherFrame: PVOID,
+    ContextRecord: *(Self.CONTEXT),
+    DispatcherContext: PVOID,
+) callconv(WINAPI) EXCEPTION_DISPOSITION;
+
+pub const UNWIND_HISTORY_TABLE_SIZE = 12;
+pub const UNWIND_HISTORY_TABLE_ENTRY = extern struct {
+    ImageBase: ULONG64,
+    FunctionEntry: *Self.RUNTIME_FUNCTION,
+};
+
+pub const UNWIND_HISTORY_TABLE = extern struct {
+    Count: ULONG,
+    LocalHint: BYTE,
+    GlobalHint: BYTE,
+    Search: BYTE,
+    Once: BYTE,
+    LowAddress: ULONG64,
+    HighAddress: ULONG64,
+    Entry: [UNWIND_HISTORY_TABLE_SIZE]UNWIND_HISTORY_TABLE_ENTRY,
+};
+
+pub const UNW_FLAG_NHANDLER = 0x0;
+pub const UNW_FLAG_EHANDLER = 0x1;
+pub const UNW_FLAG_UHANDLER = 0x2;
+pub const UNW_FLAG_CHAININFO = 0x4;
 
 pub const OBJECT_ATTRIBUTES = extern struct {
     Length: ULONG,
@@ -3455,6 +3616,21 @@ pub const ASSEMBLY_STORAGE_MAP = opaque {};
 pub const FLS_CALLBACK_INFO = opaque {};
 pub const RTL_BITMAP = opaque {};
 pub const KAFFINITY = usize;
+pub const KPRIORITY = i32;
+
+pub const CLIENT_ID = extern struct {
+    UniqueProcess: HANDLE,
+    UniqueThread: HANDLE,
+};
+
+pub const THREAD_BASIC_INFORMATION = extern struct {
+    ExitStatus: NTSTATUS,
+    TebBaseAddress: PVOID,
+    ClientId: CLIENT_ID,
+    AffinityMask: KAFFINITY,
+    Priority: KPRIORITY,
+    BasePriority: KPRIORITY,
+};
 
 pub const TEB = extern struct {
     Reserved1: [12]PVOID,
@@ -3467,6 +3643,21 @@ pub const TEB = extern struct {
     ReservedForOle: PVOID,
     Reserved6: [4]PVOID,
     TlsExpansionSlots: PVOID,
+};
+
+pub const EXCEPTION_REGISTRATION_RECORD = extern struct {
+    Next: ?*EXCEPTION_REGISTRATION_RECORD,
+    Handler: ?*EXCEPTION_DISPOSITION,
+};
+
+pub const NT_TIB = extern struct {
+    ExceptionList: ?*EXCEPTION_REGISTRATION_RECORD,
+    StackBase: PVOID,
+    StackLimit: PVOID,
+    SubSystemTib: PVOID,
+    DUMMYUNIONNAME: extern union { FiberData: PVOID, Version: DWORD },
+    ArbitraryUserPointer: PVOID,
+    Self: ?*@This(),
 };
 
 /// Process Environment Block
@@ -3662,6 +3853,26 @@ pub const PEB_LDR_DATA = extern struct {
     ShutdownThreadId: HANDLE,
 };
 
+/// Microsoft documentation of this is incomplete, the fields here are taken from various resources including:
+///  - https://docs.microsoft.com/en-us/windows/win32/api/winternl/ns-winternl-peb_ldr_data
+///  - https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntldr/ldr_data_table_entry.htm
+pub const LDR_DATA_TABLE_ENTRY = extern struct {
+    Reserved1: [2]PVOID,
+    InMemoryOrderLinks: LIST_ENTRY,
+    Reserved2: [2]PVOID,
+    DllBase: PVOID,
+    EntryPoint: PVOID,
+    SizeOfImage: ULONG,
+    FullDllName: UNICODE_STRING,
+    Reserved4: [8]BYTE,
+    Reserved5: [3]PVOID,
+    DUMMYUNIONNAME: extern union {
+        CheckSum: ULONG,
+        Reserved6: PVOID,
+    },
+    TimeDateStamp: ULONG,
+};
+
 pub const RTL_USER_PROCESS_PARAMETERS = extern struct {
     AllocationSize: ULONG,
     Size: ULONG,
@@ -3754,6 +3965,20 @@ pub const PSAPI_WS_WATCH_INFORMATION = extern struct {
     FaultingVa: LPVOID,
 };
 
+pub const VM_COUNTERS = extern struct {
+    PeakVirtualSize: SIZE_T,
+    VirtualSize: SIZE_T,
+    PageFaultCount: ULONG,
+    PeakWorkingSetSize: SIZE_T,
+    WorkingSetSize: SIZE_T,
+    QuotaPeakPagedPoolUsage: SIZE_T,
+    QuotaPagedPoolUsage: SIZE_T,
+    QuotaPeakNonPagedPoolUsage: SIZE_T,
+    QuotaNonPagedPoolUsage: SIZE_T,
+    PagefileUsage: SIZE_T,
+    PeakPagefileUsage: SIZE_T,
+};
+
 pub const PROCESS_MEMORY_COUNTERS = extern struct {
     cb: DWORD,
     PageFaultCount: DWORD,
@@ -3780,6 +4005,24 @@ pub const PROCESS_MEMORY_COUNTERS_EX = extern struct {
     PeakPagefileUsage: SIZE_T,
     PrivateUsage: SIZE_T,
 };
+
+pub const GetProcessMemoryInfoError = error{
+    AccessDenied,
+    InvalidHandle,
+    Unexpected,
+};
+
+pub fn GetProcessMemoryInfo(hProcess: HANDLE) GetProcessMemoryInfoError!VM_COUNTERS {
+    var vmc: VM_COUNTERS = undefined;
+    const rc = ntdll.NtQueryInformationProcess(hProcess, .ProcessVmCounters, &vmc, @sizeOf(VM_COUNTERS), null);
+    switch (rc) {
+        .SUCCESS => return vmc,
+        .ACCESS_DENIED => return error.AccessDenied,
+        .INVALID_HANDLE => return error.InvalidHandle,
+        .INVALID_PARAMETER => unreachable,
+        else => return unexpectedStatus(rc),
+    }
+}
 
 pub const PERFORMANCE_INFORMATION = extern struct {
     cb: DWORD,
@@ -4209,4 +4452,207 @@ pub const SharedUserData: *const KUSER_SHARED_DATA = @intToPtr(*const KUSER_SHAR
 pub fn IsProcessorFeaturePresent(feature: PF) bool {
     if (@enumToInt(feature) >= PROCESSOR_FEATURE_MAX) return false;
     return SharedUserData.ProcessorFeatures[@enumToInt(feature)] == 1;
+}
+
+pub const TH32CS_SNAPHEAPLIST = 0x00000001;
+pub const TH32CS_SNAPPROCESS = 0x00000002;
+pub const TH32CS_SNAPTHREAD = 0x00000004;
+pub const TH32CS_SNAPMODULE = 0x00000008;
+pub const TH32CS_SNAPMODULE32 = 0x00000010;
+pub const TH32CS_SNAPALL = TH32CS_SNAPHEAPLIST | TH32CS_SNAPPROCESS | TH32CS_SNAPTHREAD | TH32CS_SNAPMODULE;
+pub const TH32CS_INHERIT = 0x80000000;
+
+pub const MAX_MODULE_NAME32 = 255;
+pub const MODULEENTRY32 = extern struct {
+    dwSize: DWORD,
+    th32ModuleID: DWORD,
+    th32ProcessID: DWORD,
+    GlblcntUsage: DWORD,
+    ProccntUsage: DWORD,
+    modBaseAddr: *BYTE,
+    modBaseSize: DWORD,
+    hModule: HMODULE,
+    szModule: [MAX_MODULE_NAME32 + 1]CHAR,
+    szExePath: [MAX_PATH]CHAR,
+};
+
+pub const THREADINFOCLASS = enum(c_int) {
+    ThreadBasicInformation,
+    ThreadTimes,
+    ThreadPriority,
+    ThreadBasePriority,
+    ThreadAffinityMask,
+    ThreadImpersonationToken,
+    ThreadDescriptorTableEntry,
+    ThreadEnableAlignmentFaultFixup,
+    ThreadEventPair_Reusable,
+    ThreadQuerySetWin32StartAddress,
+    ThreadZeroTlsCell,
+    ThreadPerformanceCount,
+    ThreadAmILastThread,
+    ThreadIdealProcessor,
+    ThreadPriorityBoost,
+    ThreadSetTlsArrayAddress,
+    ThreadIsIoPending,
+    // Windows 2000+ from here
+    ThreadHideFromDebugger,
+    // Windows XP+ from here
+    ThreadBreakOnTermination,
+    ThreadSwitchLegacyState,
+    ThreadIsTerminated,
+    // Windows Vista+ from here
+    ThreadLastSystemCall,
+    ThreadIoPriority,
+    ThreadCycleTime,
+    ThreadPagePriority,
+    ThreadActualBasePriority,
+    ThreadTebInformation,
+    ThreadCSwitchMon,
+    // Windows 7+ from here
+    ThreadCSwitchPmu,
+    ThreadWow64Context,
+    ThreadGroupInformation,
+    ThreadUmsInformation,
+    ThreadCounterProfiling,
+    ThreadIdealProcessorEx,
+    // Windows 8+ from here
+    ThreadCpuAccountingInformation,
+    // Windows 8.1+ from here
+    ThreadSuspendCount,
+    // Windows 10+ from here
+    ThreadHeterogeneousCpuPolicy,
+    ThreadContainerId,
+    ThreadNameInformation,
+    ThreadSelectedCpuSets,
+    ThreadSystemThreadInformation,
+    ThreadActualGroupAffinity,
+};
+
+pub const PROCESSINFOCLASS = enum(c_int) {
+    ProcessBasicInformation,
+    ProcessQuotaLimits,
+    ProcessIoCounters,
+    ProcessVmCounters,
+    ProcessTimes,
+    ProcessBasePriority,
+    ProcessRaisePriority,
+    ProcessDebugPort,
+    ProcessExceptionPort,
+    ProcessAccessToken,
+    ProcessLdtInformation,
+    ProcessLdtSize,
+    ProcessDefaultHardErrorMode,
+    ProcessIoPortHandlers,
+    ProcessPooledUsageAndLimits,
+    ProcessWorkingSetWatch,
+    ProcessUserModeIOPL,
+    ProcessEnableAlignmentFaultFixup,
+    ProcessPriorityClass,
+    ProcessWx86Information,
+    ProcessHandleCount,
+    ProcessAffinityMask,
+    ProcessPriorityBoost,
+    ProcessDeviceMap,
+    ProcessSessionInformation,
+    ProcessForegroundInformation,
+    ProcessWow64Information,
+    ProcessImageFileName,
+    ProcessLUIDDeviceMapsEnabled,
+    ProcessBreakOnTermination,
+    ProcessDebugObjectHandle,
+    ProcessDebugFlags,
+    ProcessHandleTracing,
+    ProcessIoPriority,
+    ProcessExecuteFlags,
+    ProcessTlsInformation,
+    ProcessCookie,
+    ProcessImageInformation,
+    ProcessCycleTime,
+    ProcessPagePriority,
+    ProcessInstrumentationCallback,
+    ProcessThreadStackAllocation,
+    ProcessWorkingSetWatchEx,
+    ProcessImageFileNameWin32,
+    ProcessImageFileMapping,
+    ProcessAffinityUpdateMode,
+    ProcessMemoryAllocationMode,
+    ProcessGroupInformation,
+    ProcessTokenVirtualizationEnabled,
+    ProcessConsoleHostProcess,
+    ProcessWindowInformation,
+    MaxProcessInfoClass,
+};
+
+pub const PROCESS_BASIC_INFORMATION = extern struct {
+    ExitStatus: NTSTATUS,
+    PebBaseAddress: *PEB,
+    AffinityMask: ULONG_PTR,
+    BasePriority: KPRIORITY,
+    UniqueProcessId: ULONG_PTR,
+    InheritedFromUniqueProcessId: ULONG_PTR,
+};
+
+pub const ReadMemoryError = error{
+    Unexpected,
+};
+
+pub fn ReadProcessMemory(handle: HANDLE, addr: ?LPVOID, buffer: []u8) ReadMemoryError![]u8 {
+    var nread: usize = 0;
+    switch (ntdll.NtReadVirtualMemory(
+        handle,
+        addr,
+        buffer.ptr,
+        buffer.len,
+        &nread,
+    )) {
+        .SUCCESS => return buffer[0..nread],
+        // TODO: map errors
+        else => |rc| return unexpectedStatus(rc),
+    }
+}
+
+pub const WriteMemoryError = error{
+    Unexpected,
+};
+
+pub fn WriteProcessMemory(handle: HANDLE, addr: ?LPVOID, buffer: []const u8) WriteMemoryError!usize {
+    var nwritten: usize = 0;
+    switch (ntdll.NtWriteVirtualMemory(
+        handle,
+        addr,
+        @ptrCast(*const anyopaque, buffer.ptr),
+        buffer.len,
+        &nwritten,
+    )) {
+        .SUCCESS => return nwritten,
+        // TODO: map errors
+        else => |rc| return unexpectedStatus(rc),
+    }
+}
+
+pub const ProcessBaseAddressError = GetProcessMemoryInfoError || ReadMemoryError;
+
+/// Returns the base address of the process loaded into memory.
+pub fn ProcessBaseAddress(handle: HANDLE) ProcessBaseAddressError!HMODULE {
+    var info: PROCESS_BASIC_INFORMATION = undefined;
+    var nread: DWORD = 0;
+    const rc = ntdll.NtQueryInformationProcess(
+        handle,
+        .ProcessBasicInformation,
+        &info,
+        @sizeOf(PROCESS_BASIC_INFORMATION),
+        &nread,
+    );
+    switch (rc) {
+        .SUCCESS => {},
+        .ACCESS_DENIED => return error.AccessDenied,
+        .INVALID_HANDLE => return error.InvalidHandle,
+        .INVALID_PARAMETER => unreachable,
+        else => return unexpectedStatus(rc),
+    }
+
+    var peb_buf: [@sizeOf(PEB)]u8 align(@alignOf(PEB)) = undefined;
+    const peb_out = try ReadProcessMemory(handle, info.PebBaseAddress, &peb_buf);
+    const ppeb = @ptrCast(*const PEB, @alignCast(@alignOf(PEB), peb_out.ptr));
+    return ppeb.ImageBaseAddress;
 }

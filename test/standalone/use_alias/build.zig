@@ -1,10 +1,16 @@
-const Builder = @import("std").build.Builder;
+const std = @import("std");
 
-pub fn build(b: *Builder) void {
-    const main = b.addTest("main.zig");
-    main.setBuildMode(b.standardReleaseOptions());
+pub fn build(b: *std.Build) void {
+    const test_step = b.step("test", "Test it");
+    b.default_step = test_step;
+
+    const optimize: std.builtin.OptimizeMode = .Debug;
+
+    const main = b.addTest(.{
+        .root_source_file = .{ .path = "main.zig" },
+        .optimize = optimize,
+    });
     main.addIncludePath(".");
 
-    const test_step = b.step("test", "Test it");
-    test_step.dependOn(&main.step);
+    test_step.dependOn(&main.run().step);
 }

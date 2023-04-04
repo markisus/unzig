@@ -90,6 +90,8 @@ pub usingnamespace switch (builtin.os.tag) {
         pub extern "c" fn stat(noalias path: [*:0]const u8, noalias buf: *c.Stat) c_int;
 
         pub extern "c" fn alarm(seconds: c_uint) c_uint;
+
+        pub extern "c" fn msync(addr: *align(page_size) const anyopaque, len: usize, flags: c_int) c_int;
     },
 };
 
@@ -145,14 +147,14 @@ pub extern "c" fn write(fd: c.fd_t, buf: [*]const u8, nbyte: usize) isize;
 pub extern "c" fn pwrite(fd: c.fd_t, buf: [*]const u8, nbyte: usize, offset: c.off_t) isize;
 pub extern "c" fn mmap(addr: ?*align(page_size) anyopaque, len: usize, prot: c_uint, flags: c_uint, fd: c.fd_t, offset: c.off_t) *anyopaque;
 pub extern "c" fn munmap(addr: *align(page_size) const anyopaque, len: usize) c_int;
-pub extern "c" fn msync(addr: *align(page_size) const anyopaque, len: usize, flags: c_int) c_int;
 pub extern "c" fn mprotect(addr: *align(page_size) anyopaque, len: usize, prot: c_uint) c_int;
 pub extern "c" fn link(oldpath: [*:0]const u8, newpath: [*:0]const u8, flags: c_int) c_int;
 pub extern "c" fn linkat(oldfd: c.fd_t, oldpath: [*:0]const u8, newfd: c.fd_t, newpath: [*:0]const u8, flags: c_int) c_int;
 pub extern "c" fn unlink(path: [*:0]const u8) c_int;
 pub extern "c" fn unlinkat(dirfd: c.fd_t, path: [*:0]const u8, flags: c_uint) c_int;
 pub extern "c" fn getcwd(buf: [*]u8, size: usize) ?[*]u8;
-pub extern "c" fn waitpid(pid: c.pid_t, stat_loc: ?*c_int, options: c_int) c.pid_t;
+pub extern "c" fn waitpid(pid: c.pid_t, status: ?*c_int, options: c_int) c.pid_t;
+pub extern "c" fn wait4(pid: c.pid_t, status: ?*c_int, options: c_int, ru: ?*c.rusage) c.pid_t;
 pub extern "c" fn fork() c_int;
 pub extern "c" fn access(path: [*:0]const u8, mode: c_uint) c_int;
 pub extern "c" fn faccessat(dirfd: c.fd_t, path: [*:0]const u8, mode: c_uint, flags: c_uint) c_int;
@@ -170,8 +172,11 @@ pub extern "c" fn dup(fd: c.fd_t) c_int;
 pub extern "c" fn dup2(old_fd: c.fd_t, new_fd: c.fd_t) c_int;
 pub extern "c" fn readlink(noalias path: [*:0]const u8, noalias buf: [*]u8, bufsize: usize) isize;
 pub extern "c" fn readlinkat(dirfd: c.fd_t, noalias path: [*:0]const u8, noalias buf: [*]u8, bufsize: usize) isize;
+pub extern "c" fn chmod(path: [*:0]const u8, mode: c.mode_t) c_int;
 pub extern "c" fn fchmod(fd: c.fd_t, mode: c.mode_t) c_int;
+pub extern "c" fn fchmodat(fd: c.fd_t, path: [*:0]const u8, mode: c.mode_t, flags: c_uint) c_int;
 pub extern "c" fn fchown(fd: c.fd_t, owner: c.uid_t, group: c.gid_t) c_int;
+pub extern "c" fn umask(mode: c.mode_t) c.mode_t;
 
 pub extern "c" fn rmdir(path: [*:0]const u8) c_int;
 pub extern "c" fn getenv(name: [*:0]const u8) ?[*:0]u8;
@@ -206,7 +211,7 @@ pub extern "c" fn sendto(
     dest_addr: ?*const c.sockaddr,
     addrlen: c.socklen_t,
 ) isize;
-pub extern "c" fn sendmsg(sockfd: c.fd_t, msg: *const std.x.os.Socket.Message, flags: c_int) isize;
+pub extern "c" fn sendmsg(sockfd: c.fd_t, msg: *const c.msghdr_const, flags: u32) isize;
 
 pub extern "c" fn recv(sockfd: c.fd_t, arg1: ?*anyopaque, arg2: usize, arg3: c_int) isize;
 pub extern "c" fn recvfrom(
@@ -217,7 +222,7 @@ pub extern "c" fn recvfrom(
     noalias src_addr: ?*c.sockaddr,
     noalias addrlen: ?*c.socklen_t,
 ) isize;
-pub extern "c" fn recvmsg(sockfd: c.fd_t, msg: *std.x.os.Socket.Message, flags: c_int) isize;
+pub extern "c" fn recvmsg(sockfd: c.fd_t, msg: *c.msghdr, flags: u32) isize;
 
 pub extern "c" fn kill(pid: c.pid_t, sig: c_int) c_int;
 pub extern "c" fn getdirentries(fd: c.fd_t, buf_ptr: [*]u8, nbytes: usize, basep: *i64) isize;
@@ -322,7 +327,9 @@ pub extern "c" fn getaddrinfo(
     noalias node: ?[*:0]const u8,
     noalias service: ?[*:0]const u8,
     noalias hints: ?*const c.addrinfo,
-    noalias res: **c.addrinfo,
+    /// On Linux, `res` will not be modified on error and `freeaddrinfo` will
+    /// potentially crash if you pass it an undefined pointer
+    noalias res: *?*c.addrinfo,
 ) c.EAI;
 
 pub extern "c" fn freeaddrinfo(res: *c.addrinfo) void;

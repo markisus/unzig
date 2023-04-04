@@ -1,12 +1,11 @@
 const std = @import("std");
 
-pub fn build(b: *std.build.Builder) void {
-    const target = b.standardTargetOptions(.{});
-    const mode = b.standardReleaseOptions();
-
-    const main = b.addTest("src/main.zig");
-    main.setTarget(target);
-    main.setBuildMode(mode);
+pub fn build(b: *std.Build) void {
+    const main = b.addTest(.{
+        .root_source_file = .{ .path = "src/main.zig" },
+        .target = .{},
+        .optimize = .Debug,
+    });
 
     const options = b.addOptions();
     main.addOptions("build_options", options);
@@ -18,5 +17,5 @@ pub fn build(b: *std.build.Builder) void {
     options.addOption([]const u8, "string", b.option([]const u8, "string", "s").?);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&main.step);
+    test_step.dependOn(&main.run().step);
 }

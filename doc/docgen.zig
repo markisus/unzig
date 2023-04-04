@@ -17,6 +17,24 @@ const obj_ext = builtin.object_format.fileExt(builtin.cpu.arch);
 const tmp_dir_name = "docgen_tmp";
 const test_out_path = tmp_dir_name ++ fs.path.sep_str ++ "test" ++ exe_ext;
 
+const usage =
+    \\Usage: docgen [--zig] [--skip-code-tests] input output"
+    \\
+    \\   Generates an HTML document from a docgen template.
+    \\
+    \\Options:
+    \\   -h, --help             Print this help and exit
+    \\   --skip-code-tests      Skip the doctests
+    \\
+;
+
+fn fatal(comptime format: []const u8, args: anytype) noreturn {
+    const stderr = io.getStdErr().writer();
+
+    stderr.print("error: " ++ format ++ "\n", args) catch {};
+    process.exit(1);
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -24,44 +42,66 @@ pub fn main() !void {
     const allocator = arena.allocator();
 
     var args_it = try process.argsWithAllocator(allocator);
-
     if (!args_it.skip()) @panic("expected self arg");
 
-    const zig_exe = args_it.next() orelse @panic("expected zig exe arg");
-    defer allocator.free(zig_exe);
-
-    const in_file_name = args_it.next() orelse @panic("expected input arg");
-    defer allocator.free(in_file_name);
-
-    const out_file_name = args_it.next() orelse @panic("expected output arg");
-    defer allocator.free(out_file_name);
-
+    var zig_exe: []const u8 = "zig";
+    var opt_zig_lib_dir: ?[]const u8 = null;
     var do_code_tests = true;
-    if (args_it.next()) |arg| {
-        if (mem.eql(u8, arg, "--skip-code-tests")) {
-            do_code_tests = false;
+    var files = [_][]const u8{ "", "" };
+
+    var i: usize = 0;
+    while (args_it.next()) |arg| {
+        if (mem.startsWith(u8, arg, "-")) {
+            if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
+                const stdout = io.getStdOut().writer();
+                try stdout.writeAll(usage);
+                process.exit(0);
+            } else if (mem.eql(u8, arg, "--zig")) {
+                if (args_it.next()) |param| {
+                    zig_exe = param;
+                } else {
+                    fatal("expected parameter after --zig", .{});
+                }
+            } else if (mem.eql(u8, arg, "--zig-lib-dir")) {
+                if (args_it.next()) |param| {
+                    opt_zig_lib_dir = param;
+                } else {
+                    fatal("expected parameter after --zig-lib-dir", .{});
+                }
+            } else if (mem.eql(u8, arg, "--skip-code-tests")) {
+                do_code_tests = false;
+            } else {
+                fatal("unrecognized option: '{s}'", .{arg});
+            }
         } else {
-            @panic("unrecognized arg");
+            if (i > 1) {
+                fatal("too many arguments", .{});
+            }
+            files[i] = arg;
+            i += 1;
         }
     }
+    if (i < 2) {
+        fatal("not enough arguments", .{});
+    }
 
-    var in_file = try fs.cwd().openFile(in_file_name, .{ .mode = .read_only });
+    var in_file = try fs.cwd().openFile(files[0], .{ .mode = .read_only });
     defer in_file.close();
 
-    var out_file = try fs.cwd().createFile(out_file_name, .{});
+    var out_file = try fs.cwd().createFile(files[1], .{});
     defer out_file.close();
 
     const input_file_bytes = try in_file.reader().readAllAlloc(allocator, max_doc_file_size);
 
     var buffered_writer = io.bufferedWriter(out_file.writer());
 
-    var tokenizer = Tokenizer.init(in_file_name, input_file_bytes);
+    var tokenizer = Tokenizer.init(files[0], input_file_bytes);
     var toc = try genToc(allocator, &tokenizer);
 
     try fs.cwd().makePath(tmp_dir_name);
     defer fs.cwd().deleteTree(tmp_dir_name) catch {};
 
-    try genHtml(allocator, &tokenizer, &toc, buffered_writer.writer(), zig_exe, do_code_tests);
+    try genHtml(allocator, &tokenizer, &toc, buffered_writer.writer(), zig_exe, opt_zig_lib_dir, do_code_tests);
     try buffered_writer.flush();
 }
 
@@ -205,7 +245,7 @@ const Tokenizer = struct {
             .line_start = 0,
             .line_end = 0,
         };
-        for (self.buffer) |c, i| {
+        for (self.buffer, 0..) |c, i| {
             if (i == token.start) {
                 loc.line_end = i;
                 while (loc.line_end < self.buffer.len and self.buffer[loc.line_end] != '\n') : (loc.line_end += 1) {}
@@ -289,6 +329,7 @@ const Code = struct {
     link_mode: ?std.builtin.LinkMode,
     disable_cache: bool,
     verbose_cimport: bool,
+    additional_options: []const []const u8,
 
     const Id = union(enum) {
         Test,
@@ -505,12 +546,15 @@ fn genToc(allocator: Allocator, tokenizer: *Tokenizer) !Toc {
                 } else if (mem.eql(u8, tag_name, "code_begin")) {
                     _ = try eatToken(tokenizer, Token.Id.Separator);
                     const code_kind_tok = try eatToken(tokenizer, Token.Id.TagContent);
-                    var name: []const u8 = "test";
+                    _ = try eatToken(tokenizer, Token.Id.Separator);
+                    const name_tok = try eatToken(tokenizer, Token.Id.TagContent);
+                    const name = tokenizer.buffer[name_tok.start..name_tok.end];
+                    var error_str: []const u8 = "";
                     const maybe_sep = tokenizer.next();
                     switch (maybe_sep.id) {
                         Token.Id.Separator => {
-                            const name_tok = try eatToken(tokenizer, Token.Id.TagContent);
-                            name = tokenizer.buffer[name_tok.start..name_tok.end];
+                            const error_tok = try eatToken(tokenizer, Token.Id.TagContent);
+                            error_str = tokenizer.buffer[error_tok.start..error_tok.end];
                             _ = try eatToken(tokenizer, Token.Id.BracketClose);
                         },
                         Token.Id.BracketClose => {},
@@ -528,16 +572,13 @@ fn genToc(allocator: Allocator, tokenizer: *Tokenizer) !Toc {
                     } else if (mem.eql(u8, code_kind_str, "test")) {
                         code_kind_id = Code.Id.Test;
                     } else if (mem.eql(u8, code_kind_str, "test_err")) {
-                        code_kind_id = Code.Id{ .TestError = name };
-                        name = "test";
+                        code_kind_id = Code.Id{ .TestError = error_str };
                     } else if (mem.eql(u8, code_kind_str, "test_safety")) {
-                        code_kind_id = Code.Id{ .TestSafety = name };
-                        name = "test";
+                        code_kind_id = Code.Id{ .TestSafety = error_str };
                     } else if (mem.eql(u8, code_kind_str, "obj")) {
                         code_kind_id = Code.Id{ .Obj = null };
                     } else if (mem.eql(u8, code_kind_str, "obj_err")) {
-                        code_kind_id = Code.Id{ .Obj = name };
-                        name = "test";
+                        code_kind_id = Code.Id{ .Obj = error_str };
                     } else if (mem.eql(u8, code_kind_str, "lib")) {
                         code_kind_id = Code.Id.Lib;
                     } else if (mem.eql(u8, code_kind_str, "syntax")) {
@@ -556,6 +597,8 @@ fn genToc(allocator: Allocator, tokenizer: *Tokenizer) !Toc {
                     var disable_cache = false;
                     var verbose_cimport = false;
                     var backend_stage1 = false;
+                    var additional_options = std.ArrayList([]const u8).init(allocator);
+                    defer additional_options.deinit();
 
                     const source_token = while (true) {
                         const content_tok = try eatToken(tokenizer, Token.Id.Content);
@@ -590,6 +633,10 @@ fn genToc(allocator: Allocator, tokenizer: *Tokenizer) !Toc {
                             link_mode = .Dynamic;
                         } else if (mem.eql(u8, end_tag_name, "backend_stage1")) {
                             backend_stage1 = true;
+                        } else if (mem.eql(u8, end_tag_name, "additonal_option")) {
+                            _ = try eatToken(tokenizer, Token.Id.Separator);
+                            const option = try eatToken(tokenizer, Token.Id.TagContent);
+                            try additional_options.append(tokenizer.buffer[option.start..option.end]);
                         } else if (mem.eql(u8, end_tag_name, "code_end")) {
                             _ = try eatToken(tokenizer, Token.Id.BracketClose);
                             break content_tok;
@@ -617,6 +664,7 @@ fn genToc(allocator: Allocator, tokenizer: *Tokenizer) !Toc {
                             .link_mode = link_mode,
                             .disable_cache = disable_cache,
                             .verbose_cimport = verbose_cimport,
+                            .additional_options = try additional_options.toOwnedSlice(),
                         },
                     });
                     tokenizer.code_node_count += 1;
@@ -760,17 +808,6 @@ fn writeEscaped(out: anytype, input: []const u8) !void {
 //#define VT_BOLD "\x1b[0;1m"
 //#define VT_RESET "\x1b[0m"
 
-const TermState = enum {
-    Start,
-    Escape,
-    LBracket,
-    Number,
-    AfterNumber,
-    Arg,
-    ArgNumber,
-    ExpectEnd,
-};
-
 test "term color" {
     const input_bytes = "A\x1b[32;1mgreen\x1b[0mB";
     const result = try termColor(std.testing.allocator, input_bytes);
@@ -787,61 +824,80 @@ fn termColor(allocator: Allocator, input: []const u8) ![]u8 {
     var first_number: usize = undefined;
     var second_number: usize = undefined;
     var i: usize = 0;
-    var state = TermState.Start;
+    var state: enum {
+        start,
+        escape,
+        lbracket,
+        number,
+        after_number,
+        arg,
+        arg_number,
+        expect_end,
+    } = .start;
+    var last_new_line: usize = 0;
     var open_span_count: usize = 0;
     while (i < input.len) : (i += 1) {
         const c = input[i];
         switch (state) {
-            TermState.Start => switch (c) {
-                '\x1b' => state = TermState.Escape,
+            .start => switch (c) {
+                '\x1b' => state = .escape,
+                '\n' => {
+                    try out.writeByte(c);
+                    last_new_line = buf.items.len;
+                },
                 else => try out.writeByte(c),
             },
-            TermState.Escape => switch (c) {
-                '[' => state = TermState.LBracket,
+            .escape => switch (c) {
+                '[' => state = .lbracket,
                 else => return error.UnsupportedEscape,
             },
-            TermState.LBracket => switch (c) {
+            .lbracket => switch (c) {
                 '0'...'9' => {
                     number_start_index = i;
-                    state = TermState.Number;
+                    state = .number;
                 },
                 else => return error.UnsupportedEscape,
             },
-            TermState.Number => switch (c) {
+            .number => switch (c) {
                 '0'...'9' => {},
                 else => {
                     first_number = std.fmt.parseInt(usize, input[number_start_index..i], 10) catch unreachable;
                     second_number = 0;
-                    state = TermState.AfterNumber;
+                    state = .after_number;
                     i -= 1;
                 },
             },
 
-            TermState.AfterNumber => switch (c) {
-                ';' => state = TermState.Arg,
+            .after_number => switch (c) {
+                ';' => state = .arg,
+                'D' => state = .start,
+                'K' => {
+                    buf.items.len = last_new_line;
+                    state = .start;
+                },
                 else => {
-                    state = TermState.ExpectEnd;
+                    state = .expect_end;
                     i -= 1;
                 },
             },
-            TermState.Arg => switch (c) {
+            .arg => switch (c) {
                 '0'...'9' => {
                     number_start_index = i;
-                    state = TermState.ArgNumber;
+                    state = .arg_number;
                 },
                 else => return error.UnsupportedEscape,
             },
-            TermState.ArgNumber => switch (c) {
+            .arg_number => switch (c) {
                 '0'...'9' => {},
                 else => {
                     second_number = std.fmt.parseInt(usize, input[number_start_index..i], 10) catch unreachable;
-                    state = TermState.ExpectEnd;
+                    state = .expect_end;
                     i -= 1;
                 },
             },
-            TermState.ExpectEnd => switch (c) {
+            .expect_end => switch (c) {
                 'm' => {
-                    state = TermState.Start;
+                    state = .start;
                     while (open_span_count != 0) : (open_span_count -= 1) {
                         try out.writeAll("</span>");
                     }
@@ -1226,9 +1282,10 @@ fn genHtml(
     toc: *Toc,
     out: anytype,
     zig_exe: []const u8,
+    opt_zig_lib_dir: ?[]const u8,
     do_code_tests: bool,
 ) !void {
-    var progress = Progress{};
+    var progress = Progress{ .dont_print_on_dumb = true };
     const root_node = progress.start("Generating docgen examples", toc.nodes.len);
     defer root_node.end();
 
@@ -1236,7 +1293,7 @@ fn genHtml(
     try env_map.put("ZIG_DEBUG_COLOR", "1");
 
     const host = try std.zig.system.NativeTargetInfo.detect(.{});
-    const builtin_code = try getBuiltinCode(allocator, &env_map, zig_exe);
+    const builtin_code = try getBuiltinCode(allocator, &env_map, zig_exe, opt_zig_lib_dir);
 
     for (toc.nodes) |node| {
         defer root_node.completeOne();
@@ -1328,6 +1385,9 @@ fn genHtml(
                             "--color",        "on",
                             "--enable-cache", tmp_source_file_name,
                         });
+                        if (opt_zig_lib_dir) |zig_lib_dir| {
+                            try build_args.appendSlice(&.{ "--zig-lib-dir", zig_lib_dir });
+                        }
 
                         try shell_out.print("$ zig build-exe {s} ", .{name_plus_ext});
 
@@ -1365,6 +1425,10 @@ fn genHtml(
                         if (code.verbose_cimport) {
                             try build_args.append("--verbose-cimport");
                             try shell_out.print("--verbose-cimport ", .{});
+                        }
+                        for (code.additional_options) |option| {
+                            try build_args.append(option);
+                            try shell_out.print("{s} ", .{option});
                         }
 
                         try shell_out.print("\n", .{});
@@ -1470,8 +1534,12 @@ fn genHtml(
                         defer test_args.deinit();
 
                         try test_args.appendSlice(&[_][]const u8{
-                            zig_exe, "test", tmp_source_file_name,
+                            zig_exe,              "test",
+                            tmp_source_file_name,
                         });
+                        if (opt_zig_lib_dir) |zig_lib_dir| {
+                            try test_args.appendSlice(&.{ "--zig-lib-dir", zig_lib_dir });
+                        }
                         try shell_out.print("$ zig test {s}.zig ", .{code.name});
 
                         switch (code.mode) {
@@ -1522,12 +1590,13 @@ fn genHtml(
                         defer test_args.deinit();
 
                         try test_args.appendSlice(&[_][]const u8{
-                            zig_exe,
-                            "test",
-                            "--color",
-                            "on",
+                            zig_exe,              "test",
+                            "--color",            "on",
                             tmp_source_file_name,
                         });
+                        if (opt_zig_lib_dir) |zig_lib_dir| {
+                            try test_args.appendSlice(&.{ "--zig-lib-dir", zig_lib_dir });
+                        }
                         try shell_out.print("$ zig test {s}.zig ", .{code.name});
 
                         switch (code.mode) {
@@ -1582,8 +1651,12 @@ fn genHtml(
                         defer test_args.deinit();
 
                         try test_args.appendSlice(&[_][]const u8{
-                            zig_exe, "test", tmp_source_file_name,
+                            zig_exe,              "test",
+                            tmp_source_file_name,
                         });
+                        if (opt_zig_lib_dir) |zig_lib_dir| {
+                            try test_args.appendSlice(&.{ "--zig-lib-dir", zig_lib_dir });
+                        }
                         var mode_arg: []const u8 = "";
                         switch (code.mode) {
                             .Debug => {},
@@ -1642,17 +1715,17 @@ fn genHtml(
                         defer build_args.deinit();
 
                         try build_args.appendSlice(&[_][]const u8{
-                            zig_exe,
-                            "build-obj",
+                            zig_exe,              "build-obj",
+                            "--color",            "on",
+                            "--name",             code.name,
                             tmp_source_file_name,
-                            "--color",
-                            "on",
-                            "--name",
-                            code.name,
                             try std.fmt.allocPrint(allocator, "-femit-bin={s}{c}{s}", .{
                                 tmp_dir_name, fs.path.sep, name_plus_obj_ext,
                             }),
                         });
+                        if (opt_zig_lib_dir) |zig_lib_dir| {
+                            try build_args.appendSlice(&.{ "--zig-lib-dir", zig_lib_dir });
+                        }
 
                         try shell_out.print("$ zig build-obj {s}.zig ", .{code.name});
 
@@ -1667,6 +1740,10 @@ fn genHtml(
                         if (code.target_str) |triple| {
                             try build_args.appendSlice(&[_][]const u8{ "-target", triple });
                             try shell_out.print("-target {s} ", .{triple});
+                        }
+                        for (code.additional_options) |option| {
+                            try build_args.append(option);
+                            try shell_out.print("{s} ", .{option});
                         }
 
                         if (maybe_error_match) |error_match| {
@@ -1716,13 +1793,15 @@ fn genHtml(
                         defer test_args.deinit();
 
                         try test_args.appendSlice(&[_][]const u8{
-                            zig_exe,
-                            "build-lib",
+                            zig_exe,              "build-lib",
                             tmp_source_file_name,
                             try std.fmt.allocPrint(allocator, "-femit-bin={s}{s}{s}", .{
                                 tmp_dir_name, fs.path.sep_str, bin_basename,
                             }),
                         });
+                        if (opt_zig_lib_dir) |zig_lib_dir| {
+                            try test_args.appendSlice(&.{ "--zig-lib-dir", zig_lib_dir });
+                        }
                         try shell_out.print("$ zig build-lib {s}.zig ", .{code.name});
 
                         switch (code.mode) {
@@ -1747,6 +1826,10 @@ fn genHtml(
                                     try shell_out.print("-dynamic ", .{});
                                 },
                             }
+                        }
+                        for (code.additional_options) |option| {
+                            try test_args.append(option);
+                            try shell_out.print("{s} ", .{option});
                         }
                         const result = exec(allocator, &env_map, test_args.items) catch return parseError(tokenizer, code.source_token, "test failed", .{});
                         const escaped_stderr = try escapeHtml(allocator, result.stderr);
@@ -1787,9 +1870,23 @@ fn exec(allocator: Allocator, env_map: *process.EnvMap, args: []const []const u8
     return result;
 }
 
-fn getBuiltinCode(allocator: Allocator, env_map: *process.EnvMap, zig_exe: []const u8) ![]const u8 {
-    const result = try exec(allocator, env_map, &[_][]const u8{ zig_exe, "build-obj", "--show-builtin" });
-    return result.stdout;
+fn getBuiltinCode(
+    allocator: Allocator,
+    env_map: *process.EnvMap,
+    zig_exe: []const u8,
+    opt_zig_lib_dir: ?[]const u8,
+) ![]const u8 {
+    if (opt_zig_lib_dir) |zig_lib_dir| {
+        const result = try exec(allocator, env_map, &.{
+            zig_exe, "build-obj", "--show-builtin", "--zig-lib-dir", zig_lib_dir,
+        });
+        return result.stdout;
+    } else {
+        const result = try exec(allocator, env_map, &.{
+            zig_exe, "build-obj", "--show-builtin",
+        });
+        return result.stdout;
+    }
 }
 
 fn dumpArgs(args: []const []const u8) void {

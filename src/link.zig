@@ -10,7 +10,7 @@ const wasi_libc = @import("wasi_libc.zig");
 
 const Air = @import("Air.zig");
 const Allocator = std.mem.Allocator;
-const Cache = @import("Cache.zig");
+const Cache = std.Build.Cache;
 const Compilation = @import("Compilation.zig");
 const LibCInstallation = @import("libc_installation.zig").LibCInstallation;
 const Liveness = @import("Liveness.zig");
@@ -24,6 +24,8 @@ pub const SystemLib = struct {
     needed: bool = false,
     weak: bool = false,
 };
+
+pub const SortSection = enum { name, alignment };
 
 pub const CacheMode = enum { incremental, whole };
 
@@ -121,6 +123,8 @@ pub const Options = struct {
     z_nocopyreloc: bool,
     z_now: bool,
     z_relro: bool,
+    z_common_page_size: ?u64,
+    z_max_page_size: ?u64,
     tsaware: bool,
     nxcompat: bool,
     dynamicbase: bool,
@@ -157,6 +161,7 @@ pub const Options = struct {
     disable_lld_caching: bool,
     is_test: bool,
     hash_style: HashStyle,
+    sort_section: ?SortSection,
     major_subsystem_version: ?u32,
     minor_subsystem_version: ?u32,
     gc_sections: ?bool = null,
@@ -169,6 +174,7 @@ pub const Options = struct {
     print_gc_sections: bool,
     print_icf_sections: bool,
     print_map: bool,
+    opt_bisect_limit: i32,
 
     objects: []Compilation.LinkObject,
     framework_dirs: []const []const u8,
@@ -180,8 +186,7 @@ pub const Options = struct {
 
     /// List of symbols forced as undefined in the symbol table
     /// thus forcing their resolution by the linker.
-    /// Corresponds to `-u <symbol>` for ELF and `/include:<symbol>` for COFF/PE.
-    /// TODO add handling for MachO.
+    /// Corresponds to `-u <symbol>` for ELF/MachO and `/include:<symbol>` for COFF/PE.
     force_undefined_symbols: std.StringArrayHashMapUnmanaged(void),
 
     version: ?std.builtin.Version,
@@ -218,6 +223,16 @@ pub const Options = struct {
     /// (Darwin) remove dylibs that are unreachable by the entry point or exported symbols
     dead_strip_dylibs: bool = false,
 
+    /// (Windows) PDB source path prefix to instruct the linker how to resolve relative
+    /// paths when consolidating CodeView streams into a single PDB file.
+    pdb_source_path: ?[]const u8 = null,
+
+    /// (Windows) PDB output path
+    pdb_out_path: ?[]const u8 = null,
+
+    /// (Windows) .def file to specify when linking
+    module_definition_file: ?[]const u8 = null,
+
     pub fn effectiveOutputMode(options: Options) std.builtin.OutputMode {
         return if (options.use_lld) .Obj else options.output_mode;
     }
@@ -248,38 +263,7 @@ pub const File = struct {
     /// of this linking operation.
     lock: ?Cache.Lock = null,
 
-    pub const LinkBlock = union {
-        elf: Elf.TextBlock,
-        coff: Coff.Atom,
-        macho: MachO.Atom,
-        plan9: Plan9.DeclBlock,
-        c: void,
-        wasm: Wasm.DeclBlock,
-        spirv: void,
-        nvptx: void,
-    };
-
-    pub const LinkFn = union {
-        elf: Dwarf.SrcFn,
-        coff: Coff.SrcFn,
-        macho: Dwarf.SrcFn,
-        plan9: void,
-        c: void,
-        wasm: Wasm.FnData,
-        spirv: SpirV.FnData,
-        nvptx: void,
-    };
-
-    pub const Export = union {
-        elf: Elf.Export,
-        coff: Coff.Export,
-        macho: MachO.Export,
-        plan9: Plan9.Export,
-        c: void,
-        wasm: Wasm.Export,
-        spirv: void,
-        nvptx: void,
-    };
+    child_pid: ?std.ChildProcess.Id = null,
 
     /// Attempts incremental linking, if the file already exists. If
     /// incremental linking fails, falls back to truncating the file and
@@ -393,6 +377,33 @@ pub const File = struct {
                 if (build_options.only_c) unreachable;
                 if (base.file != null) return;
                 const emit = base.options.emit orelse return;
+                if (base.child_pid) |pid| {
+                    if (builtin.os.tag == .windows) {
+                        base.cast(Coff).?.ptraceAttach(pid) catch |err| {
+                            log.warn("attaching failed with error: {s}", .{@errorName(err)});
+                        };
+                    } else {
+                        // If we try to open the output file in write mode while it is running,
+                        // it will return ETXTBSY. So instead, we copy the file, atomically rename it
+                        // over top of the exe path, and then proceed normally. This changes the inode,
+                        // avoiding the error.
+                        const tmp_sub_path = try std.fmt.allocPrint(base.allocator, "{s}-{x}", .{
+                            emit.sub_path, std.crypto.random.int(u32),
+                        });
+                        try emit.directory.handle.copyFile(emit.sub_path, emit.directory.handle, tmp_sub_path, .{});
+                        try emit.directory.handle.rename(tmp_sub_path, emit.sub_path);
+                        switch (builtin.os.tag) {
+                            .linux => std.os.ptrace(std.os.linux.PTRACE.ATTACH, pid, 0, 0) catch |err| {
+                                log.warn("ptrace failure: {s}", .{@errorName(err)});
+                            },
+                            .macos => base.cast(MachO).?.ptraceAttach(pid) catch |err| {
+                                log.warn("attaching failed with error: {s}", .{@errorName(err)});
+                            },
+                            .windows => unreachable,
+                            else => return error.HotSwapUnavailableOnHostOperatingSystem,
+                        }
+                    }
+                }
                 base.file = try emit.directory.handle.createFile(emit.sub_path, .{
                     .truncate = false,
                     .read = true,
@@ -413,26 +424,7 @@ pub const File = struct {
             .Exe => {},
         }
         switch (base.tag) {
-            .macho => if (base.file) |f| {
-                if (build_options.only_c) unreachable;
-                if (comptime builtin.target.isDarwin() and builtin.target.cpu.arch == .aarch64) {
-                    if (base.options.target.cpu.arch == .aarch64) {
-                        // XNU starting with Big Sur running on arm64 is caching inodes of running binaries.
-                        // Any change to the binary will effectively invalidate the kernel's cache
-                        // resulting in a SIGKILL on each subsequent run. Since when doing incremental
-                        // linking we're modifying a binary in-place, this will end up with the kernel
-                        // killing it on every subsequent run. To circumvent it, we will copy the file
-                        // into a new inode, remove the original file, and rename the copy to match
-                        // the original file. This is super messy, but there doesn't seem any other
-                        // way to please the XNU.
-                        const emit = base.options.emit orelse return;
-                        try emit.directory.handle.copyFile(emit.sub_path, emit.directory.handle, emit.sub_path, .{});
-                    }
-                }
-                f.close();
-                base.file = null;
-            },
-            .coff, .elf, .plan9, .wasm => if (base.file) |f| {
+            .coff, .elf, .macho, .plan9, .wasm => if (base.file) |f| {
                 if (build_options.only_c) unreachable;
                 if (base.intermediary_basename != null) {
                     // The file we have open is not the final file that we want to
@@ -441,6 +433,19 @@ pub const File = struct {
                 }
                 f.close();
                 base.file = null;
+
+                if (base.child_pid) |pid| {
+                    switch (builtin.os.tag) {
+                        .linux => std.os.ptrace(std.os.linux.PTRACE.DETACH, pid, 0, 0) catch |err| {
+                            log.warn("ptrace failure: {s}", .{@errorName(err)});
+                        },
+                        .macos => base.cast(MachO).?.ptraceDetach(pid) catch |err| {
+                            log.warn("detaching failed with error: {s}", .{@errorName(err)});
+                        },
+                        .windows => base.cast(Coff).?.ptraceDetach(pid),
+                        else => return error.HotSwapUnavailableOnHostOperatingSystem,
+                    }
+                }
             },
             .c, .spirv, .nvptx => {},
         }
@@ -476,6 +481,10 @@ pub const File = struct {
         NameTooLong,
         CurrentWorkingDirectoryUnlinked,
         LockViolation,
+        NetNameDeleted,
+        DeviceBusy,
+        InvalidArgument,
+        HotSwapUnavailableOnHostOperatingSystem,
     };
 
     /// Called from within the CodeGen to lower a local variable instantion as an unnamed
@@ -502,25 +511,26 @@ pub const File = struct {
     /// Called from within CodeGen to retrieve the symbol index of a global symbol.
     /// If no symbol exists yet with this name, a new undefined global symbol will
     /// be created. This symbol may get resolved once all relocatables are (re-)linked.
-    pub fn getGlobalSymbol(base: *File, name: []const u8) UpdateDeclError!u32 {
+    /// Optionally, it is possible to specify where to expect the symbol defined if it
+    /// is an import.
+    pub fn getGlobalSymbol(base: *File, name: []const u8, lib_name: ?[]const u8) UpdateDeclError!u32 {
         if (build_options.only_c) @compileError("unreachable");
-        log.debug("getGlobalSymbol '{s}'", .{name});
+        log.debug("getGlobalSymbol '{s}' (expected in '{?s}')", .{ name, lib_name });
         switch (base.tag) {
             // zig fmt: off
-            .coff  => return @fieldParentPtr(Coff, "base", base).getGlobalSymbol(name),
+            .coff  => return @fieldParentPtr(Coff, "base", base).getGlobalSymbol(name, lib_name),
             .elf   => unreachable,
-            .macho => return @fieldParentPtr(MachO, "base", base).getGlobalSymbol(name),
+            .macho => return @fieldParentPtr(MachO, "base", base).getGlobalSymbol(name, lib_name),
             .plan9 => unreachable,
             .spirv => unreachable,
             .c     => unreachable,
-            .wasm  => return @fieldParentPtr(Wasm,  "base", base).getGlobalSymbol(name),
+            .wasm  => return @fieldParentPtr(Wasm,  "base", base).getGlobalSymbol(name, lib_name),
             .nvptx => unreachable,
             // zig fmt: on
         }
     }
 
-    /// May be called before or after updateDeclExports but must be called
-    /// after allocateDeclIndexes for any given Decl.
+    /// May be called before or after updateDeclExports for any given Decl.
     pub fn updateDecl(base: *File, module: *Module, decl_index: Module.Decl.Index) UpdateDeclError!void {
         const decl = module.declPtr(decl_index);
         log.debug("updateDecl {*} ({s}), type={}", .{ decl, decl.name, decl.ty.fmtDebug() });
@@ -543,8 +553,7 @@ pub const File = struct {
         }
     }
 
-    /// May be called before or after updateDeclExports but must be called
-    /// after allocateDeclIndexes for any given Decl.
+    /// May be called before or after updateDeclExports for any given Decl.
     pub fn updateFunc(base: *File, module: *Module, func: *Module.Fn, air: Air, liveness: Liveness) UpdateDeclError!void {
         const owner_decl = module.declPtr(func.owner_decl);
         log.debug("updateFunc {*} ({s}), type={}", .{
@@ -568,45 +577,24 @@ pub const File = struct {
         }
     }
 
-    pub fn updateDeclLineNumber(base: *File, module: *Module, decl: *Module.Decl) UpdateDeclError!void {
+    pub fn updateDeclLineNumber(base: *File, module: *Module, decl_index: Module.Decl.Index) UpdateDeclError!void {
+        const decl = module.declPtr(decl_index);
         log.debug("updateDeclLineNumber {*} ({s}), line={}", .{
             decl, decl.name, decl.src_line + 1,
         });
         assert(decl.has_tv);
         if (build_options.only_c) {
             assert(base.tag == .c);
-            return @fieldParentPtr(C, "base", base).updateDeclLineNumber(module, decl);
+            return @fieldParentPtr(C, "base", base).updateDeclLineNumber(module, decl_index);
         }
         switch (base.tag) {
-            .coff => return @fieldParentPtr(Coff, "base", base).updateDeclLineNumber(module, decl),
-            .elf => return @fieldParentPtr(Elf, "base", base).updateDeclLineNumber(module, decl),
-            .macho => return @fieldParentPtr(MachO, "base", base).updateDeclLineNumber(module, decl),
-            .c => return @fieldParentPtr(C, "base", base).updateDeclLineNumber(module, decl),
-            .wasm => return @fieldParentPtr(Wasm, "base", base).updateDeclLineNumber(module, decl),
-            .plan9 => return @fieldParentPtr(Plan9, "base", base).updateDeclLineNumber(module, decl),
+            .coff => return @fieldParentPtr(Coff, "base", base).updateDeclLineNumber(module, decl_index),
+            .elf => return @fieldParentPtr(Elf, "base", base).updateDeclLineNumber(module, decl_index),
+            .macho => return @fieldParentPtr(MachO, "base", base).updateDeclLineNumber(module, decl_index),
+            .c => return @fieldParentPtr(C, "base", base).updateDeclLineNumber(module, decl_index),
+            .wasm => return @fieldParentPtr(Wasm, "base", base).updateDeclLineNumber(module, decl_index),
+            .plan9 => return @fieldParentPtr(Plan9, "base", base).updateDeclLineNumber(module, decl_index),
             .spirv, .nvptx => {},
-        }
-    }
-
-    /// Must be called before any call to updateDecl or updateDeclExports for
-    /// any given Decl.
-    /// TODO we're transitioning to deleting this function and instead having
-    /// each linker backend notice the first time updateDecl or updateFunc is called, or
-    /// a callee referenced from AIR.
-    pub fn allocateDeclIndexes(base: *File, decl_index: Module.Decl.Index) error{OutOfMemory}!void {
-        const decl = base.options.module.?.declPtr(decl_index);
-        log.debug("allocateDeclIndexes {*} ({s})", .{ decl, decl.name });
-        if (build_options.only_c) {
-            assert(base.tag == .c);
-            return;
-        }
-        switch (base.tag) {
-            .coff => return @fieldParentPtr(Coff, "base", base).allocateDeclIndexes(decl_index),
-            .elf => return @fieldParentPtr(Elf, "base", base).allocateDeclIndexes(decl_index),
-            .macho => return @fieldParentPtr(MachO, "base", base).allocateDeclIndexes(decl_index),
-            .wasm => return @fieldParentPtr(Wasm, "base", base).allocateDeclIndexes(decl_index),
-            .plan9 => return @fieldParentPtr(Plan9, "base", base).allocateDeclIndexes(decl_index),
-            .c, .spirv, .nvptx => {},
         }
     }
 
@@ -684,6 +672,7 @@ pub const File = struct {
     /// TODO audit this error set. most of these should be collapsed into one error,
     /// and ErrorFlags should be updated to convey the meaning to the user.
     pub const FlushError = error{
+        BadDwarfCfi,
         CacheUnavailable,
         CurrentWorkingDirectoryUnlinked,
         DivisionByZero,
@@ -698,11 +687,13 @@ pub const File = struct {
         FrameworkNotFound,
         FunctionSignatureMismatch,
         GlobalTypeMismatch,
+        HotSwapUnavailableOnHostOperatingSystem,
         InvalidCharacter,
         InvalidEntryKind,
         InvalidFeatureSet,
         InvalidFormat,
         InvalidIndex,
+        InvalidInitFunc,
         InvalidMagicByte,
         InvalidWasmVersion,
         LLDCrashed,
@@ -723,6 +714,8 @@ pub const File = struct {
         MissingEndForExpression,
         /// TODO: this should be removed from the error set in favor of using ErrorFlags
         MissingMainEntrypoint,
+        /// TODO: this should be removed from the error set in favor of using ErrorFlags
+        MissingSection,
         MissingSymbol,
         MissingTableSymbols,
         ModuleNameMismatch,
@@ -856,8 +849,7 @@ pub const File = struct {
         AnalysisFail,
     };
 
-    /// May be called before or after updateDecl, but must be called after
-    /// allocateDeclIndexes for any given Decl.
+    /// May be called before or after updateDecl for any given Decl.
     pub fn updateDeclExports(
         base: *File,
         module: *Module,
@@ -893,6 +885,8 @@ pub const File = struct {
     /// The linker is passed information about the containing atom, `parent_atom_index`, and offset within it's
     /// memory buffer, `offset`, so that it can make a note of potential relocation sites, should the
     /// `Decl`'s address was not yet resolved, or the containing atom gets moved in virtual memory.
+    /// May be called before or after updateFunc/updateDecl therefore it is up to the linker to allocate
+    /// the block/atom.
     pub fn getDeclVAddr(base: *File, decl_index: Module.Decl.Index, reloc_info: RelocInfo) !u64 {
         if (build_options.only_c) unreachable;
         switch (base.tag) {
@@ -1085,9 +1079,11 @@ pub const File = struct {
                 log.warn("failed to save archive hash digest file: {s}", .{@errorName(err)});
             };
 
-            man.writeManifest() catch |err| {
-                log.warn("failed to write cache manifest when archiving: {s}", .{@errorName(err)});
-            };
+            if (man.have_exclusive_lock) {
+                man.writeManifest() catch |err| {
+                    log.warn("failed to write cache manifest when archiving: {s}", .{@errorName(err)});
+                };
+            }
 
             base.lock = man.toOwnedLock();
         }
@@ -1107,6 +1103,26 @@ pub const File = struct {
     pub const ErrorFlags = struct {
         no_entry_point_found: bool = false,
         missing_libc: bool = false,
+    };
+
+    pub const LazySymbol = struct {
+        kind: enum { code, const_data },
+        ty: Type,
+
+        pub const Context = struct {
+            mod: *Module,
+
+            pub fn hash(ctx: @This(), sym: LazySymbol) u32 {
+                var hasher = std.hash.Wyhash.init(0);
+                std.hash.autoHash(&hasher, sym.kind);
+                sym.ty.hashWithHasher(&hasher, ctx.mod);
+                return @truncate(u32, hasher.final());
+            }
+
+            pub fn eql(ctx: @This(), lhs: LazySymbol, rhs: LazySymbol, _: usize) bool {
+                return lhs.kind == rhs.kind and lhs.ty.eql(rhs.ty, ctx.mod);
+            }
+        };
     };
 
     pub const C = @import("link/C.zig");

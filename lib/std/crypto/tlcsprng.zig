@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const root = @import("root");
 const mem = std.mem;
 const os = std.os;
 
@@ -42,9 +41,11 @@ const maybe_have_wipe_on_fork = builtin.os.isAtLeast(.linux, .{
 }) orelse true;
 const is_haiku = builtin.os.tag == .haiku;
 
+const Rng = std.rand.DefaultCsprng;
+
 const Context = struct {
     init_state: enum(u8) { uninitialized = 0, initialized, failed },
-    gimli: std.crypto.core.Gimli,
+    rng: Rng,
 };
 
 var install_atfork_handler = std.once(struct {
@@ -67,8 +68,8 @@ fn tlsCsprngFill(_: *anyopaque, buffer: []u8) void {
     // Allow applications to decide they would prefer to have every call to
     // std.crypto.random always make an OS syscall, rather than rely on an
     // application implementation of a CSPRNG.
-    if (comptime std.meta.globalOption("crypto_always_getrandom", bool) orelse false) {
-        return fillWithOsEntropy(buffer);
+    if (std.options.crypto_always_getrandom) {
+        return defaultRandomSeed(buffer);
     }
 
     if (wipe_mem.len == 0) {
@@ -86,7 +87,7 @@ fn tlsCsprngFill(_: *anyopaque, buffer: []u8) void {
             ) catch {
                 // Could not allocate memory for the local state, fall back to
                 // the OS syscall.
-                return fillWithOsEntropy(buffer);
+                return std.options.cryptoRandomSeed(buffer);
             };
             // The memory is already zero-initialized.
         } else {
@@ -94,7 +95,7 @@ fn tlsCsprngFill(_: *anyopaque, buffer: []u8) void {
             const S = struct {
                 threadlocal var buf: Context align(mem.page_size) = .{
                     .init_state = .uninitialized,
-                    .gimli = undefined,
+                    .rng = undefined,
                 };
             };
             wipe_mem = mem.asBytes(&S.buf);
@@ -128,14 +129,14 @@ fn tlsCsprngFill(_: *anyopaque, buffer: []u8) void {
             // Since we failed to set up fork safety, we fall back to always
             // calling getrandom every time.
             ctx.init_state = .failed;
-            return fillWithOsEntropy(buffer);
+            return std.options.cryptoRandomSeed(buffer);
         },
         .initialized => {
             return fillWithCsprng(buffer);
         },
         .failed => {
             if (want_fork_safety) {
-                return fillWithOsEntropy(buffer);
+                return std.options.cryptoRandomSeed(buffer);
             } else {
                 unreachable;
             }
@@ -157,32 +158,24 @@ fn childAtForkHandler() callconv(.C) void {
 
 fn fillWithCsprng(buffer: []u8) void {
     const ctx = @ptrCast(*Context, wipe_mem.ptr);
-    if (buffer.len != 0) {
-        ctx.gimli.squeeze(buffer);
-    } else {
-        ctx.gimli.permute();
-    }
-    mem.set(u8, ctx.gimli.toSlice()[0..std.crypto.core.Gimli.RATE], 0);
+    return ctx.rng.fill(buffer);
 }
 
-fn fillWithOsEntropy(buffer: []u8) void {
+pub fn defaultRandomSeed(buffer: []u8) void {
     os.getrandom(buffer) catch @panic("getrandom() failed to provide entropy");
 }
 
 fn initAndFill(buffer: []u8) void {
-    var seed: [std.crypto.core.Gimli.BLOCKBYTES]u8 = undefined;
+    var seed: [Rng.secret_seed_length]u8 = undefined;
     // Because we panic on getrandom() failing, we provide the opportunity
     // to override the default seed function. This also makes
     // `std.crypto.random` available on freestanding targets, provided that
-    // the `cryptoRandomSeed` function is provided.
-    if (@hasDecl(root, "cryptoRandomSeed")) {
-        root.cryptoRandomSeed(&seed);
-    } else {
-        fillWithOsEntropy(&seed);
-    }
+    // the `std.options.cryptoRandomSeed` function is provided.
+    std.options.cryptoRandomSeed(&seed);
 
     const ctx = @ptrCast(*Context, wipe_mem.ptr);
-    ctx.gimli = std.crypto.core.Gimli.init(seed);
+    ctx.rng = Rng.init(seed);
+    std.crypto.utils.secureZero(u8, &seed);
 
     // This is at the end so that accidental recursive dependencies result
     // in stack overflows instead of invalid random data.

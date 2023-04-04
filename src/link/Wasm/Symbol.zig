@@ -20,6 +20,9 @@ name: u32,
 index: u32,
 /// Represents the kind of the symbol, such as a function or global.
 tag: Tag,
+/// Contains the virtual address of the symbol, relative to the start of its section.
+/// This differs from the offset of an `Atom` which is relative to the start of a segment.
+virtual_address: u32,
 
 pub const Tag = enum {
     function,
@@ -87,6 +90,10 @@ pub fn requiresImport(symbol: Symbol) bool {
     return true;
 }
 
+pub fn isTLS(symbol: Symbol) bool {
+    return symbol.flags & @enumToInt(Flag.WASM_SYM_TLS) != 0;
+}
+
 pub fn hasFlag(symbol: Symbol, flag: Flag) bool {
     return symbol.flags & @enumToInt(flag) != 0;
 }
@@ -139,12 +146,10 @@ pub fn isNoStrip(symbol: Symbol) bool {
     return symbol.flags & @enumToInt(Flag.WASM_SYM_NO_STRIP) != 0;
 }
 
-pub fn isExported(symbol: Symbol) bool {
+pub fn isExported(symbol: Symbol, is_dynamic: bool) bool {
     if (symbol.isUndefined() or symbol.isLocal()) return false;
-    if (symbol.isHidden()) return false;
-    if (symbol.hasFlag(.WASM_SYM_EXPORTED)) return true;
-    if (symbol.hasFlag(.WASM_SYM_BINDING_WEAK)) return false;
-    return true;
+    if (is_dynamic and symbol.isVisible()) return true;
+    return symbol.hasFlag(.WASM_SYM_EXPORTED);
 }
 
 pub fn isWeak(symbol: Symbol) bool {

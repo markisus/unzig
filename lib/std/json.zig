@@ -1163,11 +1163,12 @@ const ArrayList = std.ArrayList;
 const StringArrayHashMap = std.StringArrayHashMap;
 
 pub const ValueTree = struct {
-    arena: ArenaAllocator,
+    arena: *ArenaAllocator,
     root: Value,
 
     pub fn deinit(self: *ValueTree) void {
         self.arena.deinit();
+        self.arena.child_allocator.destroy(self.arena);
     }
 };
 
@@ -1279,7 +1280,7 @@ fn parsedEqual(a: anytype, b: @TypeOf(a)) bool {
             }
         },
         .Array => {
-            for (a) |e, i|
+            for (a, 0..) |e, i|
                 if (!parsedEqual(e, b[i])) return false;
             return true;
         },
@@ -1293,7 +1294,7 @@ fn parsedEqual(a: anytype, b: @TypeOf(a)) bool {
             .One => return parsedEqual(a.*, b.*),
             .Slice => {
                 if (a.len != b.len) return false;
-                for (a) |e, i|
+                for (a, 0..) |e, i|
                     if (!parsedEqual(e, b[i])) return false;
                 return true;
             },
@@ -1384,7 +1385,7 @@ fn ParseInternalErrorImpl(comptime T: type, comptime inferred_types: []const typ
             return errors;
         },
         .Array => |arrayInfo| {
-            return error{ UnexpectedEndOfJson, UnexpectedToken } || TokenStream.Error ||
+            return error{ UnexpectedEndOfJson, UnexpectedToken, LengthMismatch } || TokenStream.Error ||
                 UnescapeValidStringError ||
                 ParseInternalErrorImpl(arrayInfo.child, inferred_types ++ [_]type{T});
         },
@@ -1510,6 +1511,34 @@ fn parseInternal(
             }
         },
         .Struct => |structInfo| {
+            if (structInfo.is_tuple) {
+                switch (token) {
+                    .ArrayBegin => {},
+                    else => return error.UnexpectedToken,
+                }
+                var r: T = undefined;
+                var child_options = options;
+                child_options.allow_trailing_data = true;
+                var fields_seen: usize = 0;
+                errdefer {
+                    inline for (0..structInfo.fields.len) |i| {
+                        if (i < fields_seen) {
+                            parseFree(structInfo.fields[i].type, r[i], options);
+                        }
+                    }
+                }
+                inline for (0..structInfo.fields.len) |i| {
+                    r[i] = try parse(structInfo.fields[i].type, tokens, child_options);
+                    fields_seen = i + 1;
+                }
+                const tok = (try tokens.next()) orelse return error.UnexpectedEndOfJson;
+                switch (tok) {
+                    .ArrayEnd => {},
+                    else => return error.UnexpectedToken,
+                }
+                return r;
+            }
+
             switch (token) {
                 .ObjectBegin => {},
                 else => return error.UnexpectedToken,
@@ -1517,7 +1546,7 @@ fn parseInternal(
             var r: T = undefined;
             var fields_seen = [_]bool{false} ** structInfo.fields.len;
             errdefer {
-                inline for (structInfo.fields) |field, i| {
+                inline for (structInfo.fields, 0..) |field, i| {
                     if (fields_seen[i] and !field.is_comptime) {
                         parseFree(field.type, @field(r, field.name), options);
                     }
@@ -1532,31 +1561,26 @@ fn parseInternal(
                         var child_options = options;
                         child_options.allow_trailing_data = true;
                         var found = false;
-                        inline for (structInfo.fields) |field, i| {
-                            // TODO: using switches here segfault the compiler (#2727?)
-                            if ((stringToken.escapes == .None and mem.eql(u8, field.name, key_source_slice)) or (stringToken.escapes == .Some and (field.name.len == stringToken.decodedLength() and encodesTo(field.name, key_source_slice)))) {
-                                // if (switch (stringToken.escapes) {
-                                //     .None => mem.eql(u8, field.name, key_source_slice),
-                                //     .Some => (field.name.len == stringToken.decodedLength() and encodesTo(field.name, key_source_slice)),
-                                // }) {
+                        inline for (structInfo.fields, 0..) |field, i| {
+                            if (switch (stringToken.escapes) {
+                                .None => mem.eql(u8, field.name, key_source_slice),
+                                .Some => (field.name.len == stringToken.decodedLength() and encodesTo(field.name, key_source_slice)),
+                            }) {
                                 if (fields_seen[i]) {
-                                    // switch (options.duplicate_field_behavior) {
-                                    //     .UseFirst => {},
-                                    //     .Error => {},
-                                    //     .UseLast => {},
-                                    // }
-                                    if (options.duplicate_field_behavior == .UseFirst) {
-                                        // unconditonally ignore value. for comptime fields, this skips check against default_value
-                                        parseFree(field.type, try parse(field.type, tokens, child_options), child_options);
-                                        found = true;
-                                        break;
-                                    } else if (options.duplicate_field_behavior == .Error) {
-                                        return error.DuplicateJSONField;
-                                    } else if (options.duplicate_field_behavior == .UseLast) {
-                                        if (!field.is_comptime) {
-                                            parseFree(field.type, @field(r, field.name), child_options);
-                                        }
-                                        fields_seen[i] = false;
+                                    switch (options.duplicate_field_behavior) {
+                                        .UseFirst => {
+                                            // unconditonally ignore value. for comptime fields, this skips check against default_value
+                                            parseFree(field.type, try parse(field.type, tokens, child_options), child_options);
+                                            found = true;
+                                            break;
+                                        },
+                                        .Error => return error.DuplicateJSONField,
+                                        .UseLast => {
+                                            if (!field.is_comptime) {
+                                                parseFree(field.type, @field(r, field.name), child_options);
+                                            }
+                                            fields_seen[i] = false;
+                                        },
                                     }
                                 }
                                 if (field.is_comptime) {
@@ -1583,7 +1607,7 @@ fn parseInternal(
                     else => return error.UnexpectedToken,
                 }
             }
-            inline for (structInfo.fields) |field, i| {
+            inline for (structInfo.fields, 0..) |field, i| {
                 if (!fields_seen[i]) {
                     if (field.default_value) |default_ptr| {
                         if (!field.is_comptime) {
@@ -1625,6 +1649,7 @@ fn parseInternal(
                     if (arrayInfo.child != u8) return error.UnexpectedToken;
                     var r: T = undefined;
                     const source_slice = stringToken.slice(tokens.slice, tokens.i - 1);
+                    if (r.len != stringToken.decodedLength()) return error.LengthMismatch;
                     switch (stringToken.escapes) {
                         .None => mem.copy(u8, &r, source_slice),
                         .Some => try unescapeValidString(&r, source_slice),
@@ -1638,7 +1663,7 @@ fn parseInternal(
             const allocator = options.allocator orelse return error.AllocatorRequired;
             switch (ptrInfo.size) {
                 .One => {
-                    const r: T = try allocator.create(ptrInfo.child);
+                    const r: *ptrInfo.child = try allocator.create(ptrInfo.child);
                     errdefer allocator.destroy(r);
                     r.* = try parseInternal(ptrInfo.child, token, tokens, options);
                     return r;
@@ -1677,17 +1702,14 @@ fn parseInternal(
                             if (ptrInfo.child != u8) return error.UnexpectedToken;
                             const source_slice = stringToken.slice(tokens.slice, tokens.i - 1);
                             const len = stringToken.decodedLength();
-                            const output = try allocator.alloc(u8, len + @boolToInt(ptrInfo.sentinel != null));
+                            const output = if (ptrInfo.sentinel) |sentinel_ptr|
+                                try allocator.allocSentinel(u8, len, @ptrCast(*const u8, sentinel_ptr).*)
+                            else
+                                try allocator.alloc(u8, len);
                             errdefer allocator.free(output);
                             switch (stringToken.escapes) {
                                 .None => mem.copy(u8, output, source_slice),
                                 .Some => try unescapeValidString(output, source_slice),
-                            }
-
-                            if (ptrInfo.sentinel) |some| {
-                                const char = @ptrCast(*const u8, some).*;
-                                output[len] = char;
-                                return output[0..len :char];
                             }
 
                             return output;
@@ -1743,7 +1765,37 @@ pub fn parseFree(comptime T: type, value: T, options: ParseOptions) void {
         .Struct => |structInfo| {
             inline for (structInfo.fields) |field| {
                 if (!field.is_comptime) {
-                    parseFree(field.type, @field(value, field.name), options);
+                    var should_free = true;
+                    if (field.default_value) |default| {
+                        switch (@typeInfo(field.type)) {
+                            // We must not attempt to free pointers to struct default values
+                            .Pointer => |fieldPtrInfo| {
+                                const field_value = @field(value, field.name);
+                                const field_ptr = switch (fieldPtrInfo.size) {
+                                    .One => field_value,
+                                    .Slice => field_value.ptr,
+                                    else => unreachable, // Other pointer types are not parseable
+                                };
+                                const field_addr = @ptrToInt(field_ptr);
+
+                                const casted_default = @ptrCast(*const field.type, @alignCast(@alignOf(field.type), default)).*;
+                                const default_ptr = switch (fieldPtrInfo.size) {
+                                    .One => casted_default,
+                                    .Slice => casted_default.ptr,
+                                    else => unreachable, // Other pointer types are not parseable
+                                };
+                                const default_addr = @ptrToInt(default_ptr);
+
+                                if (field_addr == default_addr) {
+                                    should_free = false;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    if (should_free) {
+                        parseFree(field.type, @field(value, field.name), options);
+                    }
                 }
             }
         },
@@ -1808,8 +1860,12 @@ pub const Parser = struct {
     pub fn parse(p: *Parser, input: []const u8) !ValueTree {
         var s = TokenStream.init(input);
 
-        var arena = ArenaAllocator.init(p.allocator);
+        var arena = try p.allocator.create(ArenaAllocator);
+        errdefer p.allocator.destroy(arena);
+
+        arena.* = ArenaAllocator.init(p.allocator);
         errdefer arena.deinit();
+
         const allocator = arena.allocator();
 
         while (try s.next()) |token| {
@@ -2262,7 +2318,7 @@ pub fn stringify(
                 return value.jsonStringify(options, out_stream);
             }
 
-            try out_stream.writeByte('{');
+            try out_stream.writeByte(if (S.is_tuple) '[' else '{');
             var field_output = false;
             var child_options = options;
             if (child_options.whitespace) |*child_whitespace| {
@@ -2292,11 +2348,13 @@ pub fn stringify(
                     if (child_options.whitespace) |child_whitespace| {
                         try child_whitespace.outputIndent(out_stream);
                     }
-                    try encodeJsonString(Field.name, options, out_stream);
-                    try out_stream.writeByte(':');
-                    if (child_options.whitespace) |child_whitespace| {
-                        if (child_whitespace.separator) {
-                            try out_stream.writeByte(' ');
+                    if (!S.is_tuple) {
+                        try encodeJsonString(Field.name, options, out_stream);
+                        try out_stream.writeByte(':');
+                        if (child_options.whitespace) |child_whitespace| {
+                            if (child_whitespace.separator) {
+                                try out_stream.writeByte(' ');
+                            }
                         }
                     }
                     try stringify(@field(value, Field.name), child_options, out_stream);
@@ -2307,7 +2365,7 @@ pub fn stringify(
                     try whitespace.outputIndent(out_stream);
                 }
             }
-            try out_stream.writeByte('}');
+            try out_stream.writeByte(if (S.is_tuple) ']' else '}');
             return;
         },
         .ErrorSet => return stringify(@as([]const u8, @errorName(value)), options, out_stream),
@@ -2322,10 +2380,13 @@ pub fn stringify(
                     return stringify(value.*, options, out_stream);
                 },
             },
-            // TODO: .Many when there is a sentinel (waiting for https://github.com/ziglang/zig/pull/3972)
-            .Slice => {
-                if (ptr_info.child == u8 and options.string == .String and std.unicode.utf8ValidateSlice(value)) {
-                    try encodeJsonString(value, options, out_stream);
+            .Many, .Slice => {
+                if (ptr_info.size == .Many and ptr_info.sentinel == null)
+                    @compileError("unable to stringify type '" ++ @typeName(T) ++ "' without sentinel");
+                const slice = if (ptr_info.size == .Many) mem.span(value) else value;
+
+                if (ptr_info.child == u8 and options.string == .String and std.unicode.utf8ValidateSlice(slice)) {
+                    try encodeJsonString(slice, options, out_stream);
                     return;
                 }
 
@@ -2334,7 +2395,7 @@ pub fn stringify(
                 if (child_options.whitespace) |*whitespace| {
                     whitespace.indent_level += 1;
                 }
-                for (value) |x, i| {
+                for (slice, 0..) |x, i| {
                     if (i != 0) {
                         try out_stream.writeByte(',');
                     }
@@ -2343,7 +2404,7 @@ pub fn stringify(
                     }
                     try stringify(x, child_options, out_stream);
                 }
-                if (value.len != 0) {
+                if (slice.len != 0) {
                     if (options.whitespace) |whitespace| {
                         try whitespace.outputIndent(out_stream);
                     }
@@ -2498,6 +2559,12 @@ test "stringify string" {
     try teststringify("\"\\/\"", "/", StringifyOptions{ .string = .{ .String = .{ .escape_solidus = true } } });
 }
 
+test "stringify many-item sentinel-terminated string" {
+    try teststringify("\"hello\"", @as([*:0]const u8, "hello"), StringifyOptions{});
+    try teststringify("\"with\\nescapes\\r\"", @as([*:0]const u8, "with\nescapes\r"), StringifyOptions{ .string = .{ .String = .{ .escape_unicode = true } } });
+    try teststringify("\"with unicode\\u0001\"", @as([*:0]const u8, "with unicode\u{1}"), StringifyOptions{ .string = .{ .String = .{ .escape_unicode = true } } });
+}
+
 test "stringify tagged unions" {
     try teststringify("42", union(enum) {
         Foo: u32,
@@ -2612,6 +2679,10 @@ test "stringify vector" {
     try teststringify("[1,1]", @splat(2, @as(u32, 1)), StringifyOptions{});
 }
 
+test "stringify tuple" {
+    try teststringify("[\"foo\",42]", std.meta.Tuple(&.{ []const u8, usize }){ "foo", 42 }, StringifyOptions{});
+}
+
 fn teststringify(expected: []const u8, value: anytype, options: StringifyOptions) !void {
     const ValidationWriter = struct {
         const Self = @This();
@@ -2682,4 +2753,17 @@ test "encodesTo" {
     try testing.expectEqual(true, encodesTo("ą", "\\u0105"));
     try testing.expectEqual(true, encodesTo("😂", "\\ud83d\\ude02"));
     try testing.expectEqual(true, encodesTo("withąunicode😂", "with\\u0105unicode\\ud83d\\ude02"));
+}
+
+test "deserializing string with escape sequence into sentinel slice" {
+    const json = "\"\\n\"";
+    var token_stream = std.json.TokenStream.init(json);
+    const options = ParseOptions{ .allocator = std.testing.allocator };
+
+    // Pre-fix, this line would panic:
+    const result = try std.json.parse([:0]const u8, &token_stream, options);
+    defer std.json.parseFree([:0]const u8, result, options);
+
+    // Double-check that we're getting the right result
+    try testing.expect(mem.eql(u8, result, "\n"));
 }

@@ -394,3 +394,37 @@ test "accessing reinterpreted memory of parent object" {
         try testing.expect(b == expected);
     }
 }
+
+test "bitcast packed union to integer" {
+    const U = packed union {
+        x: u1,
+        y: u2,
+    };
+
+    comptime {
+        const a = U{ .x = 1 };
+        const b = U{ .y = 2 };
+        const cast_a = @bitCast(u2, a);
+        const cast_b = @bitCast(u2, b);
+
+        // truncated because the upper bit is garbage memory that we don't care about
+        try testing.expectEqual(@as(u1, 1), @truncate(u1, cast_a));
+        try testing.expectEqual(@as(u2, 2), cast_b);
+    }
+}
+
+test "mutate entire slice at comptime" {
+    comptime {
+        var buf: [3]u8 = undefined;
+        const x: [2]u8 = .{ 1, 2 }; // Avoid RLS
+        buf[1..3].* = x;
+    }
+}
+
+test "dereference undefined pointer to zero-bit type" {
+    const p0: *void = undefined;
+    try testing.expectEqual({}, p0.*);
+
+    const p1: *[0]u32 = undefined;
+    try testing.expect(p1.*.len == 0);
+}

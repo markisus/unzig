@@ -87,6 +87,17 @@ pub fn ArrayListAligned(comptime T: type, comptime alignment: ?u29) type {
             };
         }
 
+        /// ArrayList takes ownership of the passed in slice. The slice must have been
+        /// allocated with `allocator`.
+        /// Deinitialize with `deinit` or use `toOwnedSlice`.
+        pub fn fromOwnedSliceSentinel(allocator: Allocator, comptime sentinel: T, slice: [:sentinel]T) Self {
+            return Self{
+                .items = slice,
+                .capacity = slice.len + 1,
+                .allocator = allocator,
+            };
+        }
+
         /// Initializes an ArrayListUnmanaged with the `items` and `capacity` fields
         /// of this ArrayList. Empties this ArrayList.
         pub fn moveToUnmanaged(self: *Self) ArrayListAlignedUnmanaged(T, alignment) {
@@ -130,11 +141,21 @@ pub fn ArrayListAligned(comptime T: type, comptime alignment: ?u29) type {
             return cloned;
         }
 
-        /// Insert `item` at index `n` by moving `list[n .. list.len]` to make room.
+        /// Insert `item` at index `n`. Moves `list[n .. list.len]` to higher indices to make room.
+        /// If `n` is equal to the length of the list this operation is equivalent to append.
         /// This operation is O(N).
         /// Invalidates pointers if additional memory is needed.
         pub fn insert(self: *Self, n: usize, item: T) Allocator.Error!void {
             try self.ensureUnusedCapacity(1);
+            self.insertAssumeCapacity(n, item);
+        }
+
+        /// Insert `item` at index `n`. Moves `list[n .. list.len]` to higher indices to make room.
+        /// If `n` is equal to the length of the list this operation is equivalent to append.
+        /// This operation is O(N).
+        /// Asserts that there is enough capacity for the new item.
+        pub fn insertAssumeCapacity(self: *Self, n: usize, item: T) void {
+            assert(self.items.len < self.capacity);
             self.items.len += 1;
 
             mem.copyBackwards(T, self.items[n + 1 .. self.items.len], self.items[n .. self.items.len - 1]);
@@ -172,7 +193,7 @@ pub fn ArrayListAligned(comptime T: type, comptime alignment: ?u29) type {
                 mem.copy(T, range, new_items);
                 const after_subrange = start + new_items.len;
 
-                for (self.items[after_range..]) |item, i| {
+                for (self.items[after_range..], 0..) |item, i| {
                     self.items[after_subrange..][i] = item;
                 }
 
@@ -205,7 +226,7 @@ pub fn ArrayListAligned(comptime T: type, comptime alignment: ?u29) type {
             if (newlen == i) return self.pop();
 
             const old_item = self.items[i];
-            for (self.items[i..newlen]) |*b, j| b.* = self.items[i + 1 + j];
+            for (self.items[i..newlen], 0..) |*b, j| b.* = self.items[i + 1 + j];
             self.items[newlen] = undefined;
             self.items.len = newlen;
             return old_item;
@@ -468,6 +489,20 @@ pub fn ArrayListAligned(comptime T: type, comptime alignment: ?u29) type {
         pub fn unusedCapacitySlice(self: Self) Slice {
             return self.allocatedSlice()[self.items.len..];
         }
+
+        /// Return the last element from the list.
+        /// Asserts the list has at least one item.
+        pub fn getLast(self: Self) T {
+            const val = self.items[self.items.len - 1];
+            return val;
+        }
+
+        /// Return the last element from the list, or
+        /// return `null` if list is empty.
+        pub fn getLastOrNull(self: Self) ?T {
+            if (self.items.len == 0) return null;
+            return self.getLast();
+        }
     };
 }
 
@@ -532,6 +567,26 @@ pub fn ArrayListAlignedUnmanaged(comptime T: type, comptime alignment: ?u29) typ
             return .{ .items = self.items, .capacity = self.capacity, .allocator = allocator };
         }
 
+        /// ArrayListUnmanaged takes ownership of the passed in slice. The slice must have been
+        /// allocated with `allocator`.
+        /// Deinitialize with `deinit` or use `toOwnedSlice`.
+        pub fn fromOwnedSlice(slice: Slice) Self {
+            return Self{
+                .items = slice,
+                .capacity = slice.len,
+            };
+        }
+
+        /// ArrayListUnmanaged takes ownership of the passed in slice. The slice must have been
+        /// allocated with `allocator`.
+        /// Deinitialize with `deinit` or use `toOwnedSlice`.
+        pub fn fromOwnedSliceSentinel(comptime sentinel: T, slice: [:sentinel]T) Self {
+            return Self{
+                .items = slice,
+                .capacity = slice.len + 1,
+            };
+        }
+
         /// The caller owns the returned memory. Empties this ArrayList.
         /// Its capacity is cleared, making deinit() safe but unnecessary to call.
         pub fn toOwnedSlice(self: *Self, allocator: Allocator) Allocator.Error!Slice {
@@ -564,12 +619,21 @@ pub fn ArrayListAlignedUnmanaged(comptime T: type, comptime alignment: ?u29) typ
             return cloned;
         }
 
-        /// Insert `item` at index `n`. Moves `list[n .. list.len]`
-        /// to higher indices to make room.
+        /// Insert `item` at index `n`. Moves `list[n .. list.len]` to higher indices to make room.
+        /// If `n` is equal to the length of the list this operation is equivalent to append.
         /// This operation is O(N).
         /// Invalidates pointers if additional memory is needed.
         pub fn insert(self: *Self, allocator: Allocator, n: usize, item: T) Allocator.Error!void {
             try self.ensureUnusedCapacity(allocator, 1);
+            self.insertAssumeCapacity(n, item);
+        }
+
+        /// Insert `item` at index `n`. Moves `list[n .. list.len]` to higher indices to make room.
+        /// If `n` is equal to the length of the list this operation is equivalent to append.
+        /// This operation is O(N).
+        /// Asserts that there is enough capacity for the new item.
+        pub fn insertAssumeCapacity(self: *Self, n: usize, item: T) void {
+            assert(self.items.len < self.capacity);
             self.items.len += 1;
 
             mem.copyBackwards(T, self.items[n + 1 .. self.items.len], self.items[n .. self.items.len - 1]);
@@ -621,7 +685,7 @@ pub fn ArrayListAlignedUnmanaged(comptime T: type, comptime alignment: ?u29) typ
             if (newlen == i) return self.pop();
 
             const old_item = self.items[i];
-            for (self.items[i..newlen]) |*b, j| b.* = self.items[i + 1 + j];
+            for (self.items[i..newlen], 0..) |*b, j| b.* = self.items[i + 1 + j];
             self.items[newlen] = undefined;
             self.items.len = newlen;
             return old_item;
@@ -913,6 +977,20 @@ pub fn ArrayListAlignedUnmanaged(comptime T: type, comptime alignment: ?u29) typ
         pub fn unusedCapacitySlice(self: Self) Slice {
             return self.allocatedSlice()[self.items.len..];
         }
+
+        /// Return the last element from the list.
+        /// Asserts the list has at least one item.
+        pub fn getLast(self: Self) T {
+            const val = self.items[self.items.len - 1];
+            return val;
+        }
+
+        /// Return the last element from the list, or
+        /// return `null` if list is empty.
+        pub fn getLastOrNull(self: Self) ?T {
+            if (self.items.len == 0) return null;
+            return self.getLast();
+        }
     };
 }
 
@@ -1010,7 +1088,7 @@ test "std.ArrayList/ArrayListUnmanaged.basic" {
             }
         }
 
-        for (list.items) |v, i| {
+        for (list.items, 0..) |v, i| {
             try testing.expect(v == @intCast(i32, i + 1));
         }
 
@@ -1060,7 +1138,7 @@ test "std.ArrayList/ArrayListUnmanaged.basic" {
             }
         }
 
-        for (list.items) |v, i| {
+        for (list.items, 0..) |v, i| {
             try testing.expect(v == @intCast(i32, i + 1));
         }
 
@@ -1250,9 +1328,9 @@ test "std.ArrayList/ArrayListUnmanaged.insert" {
         var list = ArrayList(i32).init(a);
         defer list.deinit();
 
-        try list.append(1);
+        try list.insert(0, 1);
         try list.append(2);
-        try list.append(3);
+        try list.insert(2, 3);
         try list.insert(0, 5);
         try testing.expect(list.items[0] == 5);
         try testing.expect(list.items[1] == 1);
@@ -1263,9 +1341,9 @@ test "std.ArrayList/ArrayListUnmanaged.insert" {
         var list = ArrayListUnmanaged(i32){};
         defer list.deinit(a);
 
-        try list.append(a, 1);
+        try list.insert(a, 0, 1);
         try list.append(a, 2);
-        try list.append(a, 3);
+        try list.insert(a, 2, 3);
         try list.insert(a, 0, 5);
         try testing.expect(list.items[0] == 5);
         try testing.expect(list.items[1] == 1);
@@ -1536,6 +1614,45 @@ test "std.ArrayList/ArrayListUnmanaged.addManyAsArray" {
     }
 }
 
+test "std.ArrayList/ArrayList.fromOwnedSliceSentinel" {
+    const a = testing.allocator;
+
+    var orig_list = ArrayList(u8).init(a);
+    defer orig_list.deinit();
+    try orig_list.appendSlice("foobar");
+    const sentinel_slice = try orig_list.toOwnedSliceSentinel(0);
+
+    var list = ArrayList(u8).fromOwnedSliceSentinel(a, 0, sentinel_slice);
+    defer list.deinit();
+    try testing.expectEqualStrings(list.items, "foobar");
+}
+
+test "std.ArrayList/ArrayListUnmanaged.fromOwnedSlice" {
+    const a = testing.allocator;
+
+    var list = ArrayList(u8).init(a);
+    defer list.deinit();
+    try list.appendSlice("foobar");
+
+    const slice = try list.toOwnedSlice();
+    var unmanaged = ArrayListUnmanaged(u8).fromOwnedSlice(slice);
+    defer unmanaged.deinit(a);
+    try testing.expectEqualStrings(unmanaged.items, "foobar");
+}
+
+test "std.ArrayList/ArrayListUnmanaged.fromOwnedSliceSentinel" {
+    const a = testing.allocator;
+
+    var list = ArrayList(u8).init(a);
+    defer list.deinit();
+    try list.appendSlice("foobar");
+
+    const sentinel_slice = try list.toOwnedSliceSentinel(0);
+    var unmanaged = ArrayListUnmanaged(u8).fromOwnedSliceSentinel(0, sentinel_slice);
+    defer unmanaged.deinit(a);
+    try testing.expectEqualStrings(unmanaged.items, "foobar");
+}
+
 test "std.ArrayList/ArrayListUnmanaged.toOwnedSliceSentinel" {
     const a = testing.allocator;
     {
@@ -1620,4 +1737,28 @@ test "std.ArrayList(?u32).popOrNull()" {
     try testing.expect(list.popOrNull().? == @as(u32, 1));
     try testing.expect(list.popOrNull().? == null);
     try testing.expect(list.popOrNull() == null);
+}
+
+test "std.ArrayList(u32).getLast()" {
+    const a = testing.allocator;
+
+    var list = ArrayList(u32).init(a);
+    defer list.deinit();
+
+    try list.append(2);
+    const const_list = list;
+    try testing.expectEqual(const_list.getLast(), 2);
+}
+
+test "std.ArrayList(u32).getLastOrNull()" {
+    const a = testing.allocator;
+
+    var list = ArrayList(u32).init(a);
+    defer list.deinit();
+
+    try testing.expectEqual(list.getLastOrNull(), null);
+
+    try list.append(2);
+    const const_list = list;
+    try testing.expectEqual(const_list.getLastOrNull().?, 2);
 }

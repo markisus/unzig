@@ -1,20 +1,28 @@
 const std = @import("std");
-const Builder = std.build.Builder;
 
-pub fn build(b: *Builder) void {
-    const mode = b.standardReleaseOptions();
+pub const requires_symlinks = true;
 
-    const test_step = b.step("test", "Test");
-    test_step.dependOn(b.getInstallStep());
+pub fn build(b: *std.Build) void {
+    const test_step = b.step("test", "Test it");
+    b.default_step = test_step;
 
-    const exe = b.addExecutable("main", null);
-    exe.setTarget(.{ .os_tag = .macos });
-    exe.setBuildMode(mode);
+    add(b, test_step, .Debug);
+    add(b, test_step, .ReleaseFast);
+    add(b, test_step, .ReleaseSmall);
+    add(b, test_step, .ReleaseSafe);
+}
+
+fn add(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
+    const exe = b.addExecutable(.{
+        .name = "main",
+        .optimize = optimize,
+        .target = .{ .os_tag = .macos },
+    });
     exe.addCSourceFile("main.c", &.{});
     exe.linkLibC();
     exe.entry_symbol_name = "_non_main";
 
-    const check_exe = exe.checkObject(.macho);
+    const check_exe = exe.checkObject();
 
     check_exe.checkStart("segname __TEXT");
     check_exe.checkNext("vmaddr {vmaddr}");

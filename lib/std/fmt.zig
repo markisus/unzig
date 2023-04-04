@@ -1,11 +1,12 @@
 const std = @import("std.zig");
+const builtin = @import("builtin");
+
 const io = std.io;
 const math = std.math;
 const assert = std.debug.assert;
 const mem = std.mem;
 const unicode = std.unicode;
 const meta = std.meta;
-const builtin = @import("builtin");
 const errol = @import("fmt/errol.zig");
 const lossyCast = std.math.lossyCast;
 const expectFmt = std.testing.expectFmt;
@@ -190,7 +191,7 @@ pub fn format(
                 .precision = precision,
             },
             writer,
-            default_max_depth,
+            std.options.fmt_max_depth,
         );
     }
 
@@ -569,7 +570,7 @@ pub fn formatType(
                     return writer.writeAll("{ ... }");
                 }
                 try writer.writeAll("{");
-                inline for (info.fields) |f, i| {
+                inline for (info.fields, 0..) |f, i| {
                     if (i == 0) {
                         try writer.writeAll(" ");
                     } else {
@@ -584,7 +585,7 @@ pub fn formatType(
                 return writer.writeAll("{ ... }");
             }
             try writer.writeAll("{");
-            inline for (info.fields) |f, i| {
+            inline for (info.fields, 0..) |f, i| {
                 if (i == 0) {
                     try writer.writeAll(" .");
                 } else {
@@ -611,7 +612,7 @@ pub fn formatType(
                         }
                     }
                     if (comptime std.meta.trait.isZigString(info.child)) {
-                        for (value) |item, i| {
+                        for (value, 0..) |item, i| {
                             comptime checkTextFmt(actual_fmt);
                             if (i != 0) try formatBuf(", ", options, writer);
                             try formatBuf(item, options, writer);
@@ -658,7 +659,7 @@ pub fn formatType(
                     }
                 }
                 try writer.writeAll("{ ");
-                for (value) |elem, i| {
+                for (value, 0..) |elem, i| {
                     try formatType(elem, actual_fmt, options, writer, max_depth - 1);
                     if (i != value.len - 1) {
                         try writer.writeAll(", ");
@@ -683,7 +684,7 @@ pub fn formatType(
                 }
             }
             try writer.writeAll("{ ");
-            for (value) |elem, i| {
+            for (value, 0..) |elem, i| {
                 try formatType(elem, actual_fmt, options, writer, max_depth - 1);
                 if (i < value.len - 1) {
                     try writer.writeAll(", ");
@@ -702,10 +703,7 @@ pub fn formatType(
             }
             try writer.writeAll(" }");
         },
-        .Fn => {
-            if (actual_fmt.len != 0) invalidFmtError(fmt, value);
-            return format(writer, "{s}@{x}", .{ @typeName(T), @ptrToInt(value) });
-        },
+        .Fn => @compileError("unable to format function body type, use '*const " ++ @typeName(T) ++ "' for a function pointer type"),
         .Type => {
             if (actual_fmt.len != 0) invalidFmtError(fmt, value);
             return formatBuf(@typeName(value), options, writer);
@@ -2140,15 +2138,15 @@ test "buffer" {
     {
         var buf1: [32]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf1);
-        try formatType(1234, "", FormatOptions{}, fbs.writer(), default_max_depth);
+        try formatType(1234, "", FormatOptions{}, fbs.writer(), std.options.fmt_max_depth);
         try std.testing.expect(mem.eql(u8, fbs.getWritten(), "1234"));
 
         fbs.reset();
-        try formatType('a', "c", FormatOptions{}, fbs.writer(), default_max_depth);
+        try formatType('a', "c", FormatOptions{}, fbs.writer(), std.options.fmt_max_depth);
         try std.testing.expect(mem.eql(u8, fbs.getWritten(), "a"));
 
         fbs.reset();
-        try formatType(0b1100, "b", FormatOptions{}, fbs.writer(), default_max_depth);
+        try formatType(0b1100, "b", FormatOptions{}, fbs.writer(), std.options.fmt_max_depth);
         try std.testing.expect(mem.eql(u8, fbs.getWritten(), "1100"));
     }
 }
@@ -2554,6 +2552,21 @@ test "bytes.hex" {
     try expectFmt("lowercase: 000ebabe\n", "lowercase: {x}\n", .{fmtSliceHexLower(bytes_with_zeros)});
 }
 
+/// Encodes a sequence of bytes as hexadecimal digits.
+/// Returns an array containing the encoded bytes.
+pub fn bytesToHex(input: anytype, case: Case) [input.len * 2]u8 {
+    if (input.len == 0) return [_]u8{};
+    comptime assert(@TypeOf(input[0]) == u8); // elements to encode must be unsigned bytes
+
+    const charset = "0123456789" ++ if (case == .upper) "ABCDEF" else "abcdef";
+    var result: [input.len * 2]u8 = undefined;
+    for (input, 0..) |b, i| {
+        result[i * 2 + 0] = charset[b >> 4];
+        result[i * 2 + 1] = charset[b & 15];
+    }
+    return result;
+}
+
 /// Decodes the sequence of bytes represented by the specified string of
 /// hexadecimal characters.
 /// Returns a slice of the output buffer containing the decoded bytes.
@@ -2572,6 +2585,13 @@ pub fn hexToBytes(out: []u8, input: []const u8) ![]u8 {
     }
 
     return out[0 .. in_i / 2];
+}
+
+test "bytesToHex" {
+    const input = "input slice";
+    const encoded = bytesToHex(input, .lower);
+    var decoded: [input.len]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, input, try hexToBytes(&decoded, &encoded));
 }
 
 test "hexToBytes" {

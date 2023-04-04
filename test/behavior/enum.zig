@@ -937,7 +937,6 @@ test "enum literal casting to error union with payload enum" {
 }
 
 test "constant enum initialization with differing sizes" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -1137,7 +1136,6 @@ test "tag name functions are unique" {
 }
 
 test "size of enum with only one tag which has explicit integer tag type" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1184,4 +1182,14 @@ test "runtime int to enum with one possible value" {
     if (@intToEnum(E, runtime) != .one) {
         @compileError("test failed");
     }
+}
+
+test "enum tag from a local variable" {
+    const S = struct {
+        fn Int(comptime Inner: type) type {
+            return enum(Inner) { _ };
+        }
+    };
+    const i = @intToEnum(S.Int(u32), 0);
+    try std.testing.expect(@enumToInt(i) == 0);
 }

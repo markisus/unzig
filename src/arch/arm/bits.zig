@@ -307,6 +307,9 @@ pub const Instruction = union(enum) {
         fixed: u4 = 0b1111,
         cond: u4,
     },
+    undefined_instruction: packed struct {
+        imm32: u32 = 0xe7ffdefe,
+    },
     breakpoint: packed struct {
         imm4: u4,
         fixed_1: u4 = 0b0111,
@@ -452,11 +455,11 @@ pub const Instruction = union(enum) {
             const masks = comptime blk: {
                 const base_mask: u32 = std.math.maxInt(u8);
                 var result = [_]u32{0} ** 16;
-                for (result) |*mask, i| mask.* = std.math.rotr(u32, base_mask, 2 * i);
+                for (&result, 0..) |*mask, i| mask.* = std.math.rotr(u32, base_mask, 2 * i);
                 break :blk result;
             };
 
-            return for (masks) |mask, i| {
+            return for (masks, 0..) |mask, i| {
                 if (x & mask == x) {
                     break Operand{
                         .immediate = .{
@@ -613,6 +616,7 @@ pub const Instruction = union(enum) {
             .branch => |v| @bitCast(u32, v),
             .branch_exchange => |v| @bitCast(u32, v),
             .supervisor_call => |v| @bitCast(u32, v),
+            .undefined_instruction => |v| v.imm32,
             .breakpoint => |v| @intCast(u32, v.imm4) | (@intCast(u32, v.fixed_1) << 4) | (@intCast(u32, v.imm12) << 8) | (@intCast(u32, v.fixed_2_and_cond) << 20),
         };
     }
@@ -887,6 +891,13 @@ pub const Instruction = union(enum) {
                 .cond = @enumToInt(cond),
                 .comment = comment,
             },
+        };
+    }
+
+    // This instruction has no official mnemonic equivalent so it is public as-is.
+    pub fn undefinedInstruction() Instruction {
+        return Instruction{
+            .undefined_instruction = .{},
         };
     }
 

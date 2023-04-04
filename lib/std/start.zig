@@ -14,22 +14,24 @@ var argc_argv_ptr: [*]usize = undefined;
 
 const start_sym_name = if (native_arch.isMIPS()) "__start" else "_start";
 
+// The self-hosted compiler is not fully capable of handling all of this start.zig file.
+// Until then, we have simplified logic here for self-hosted. TODO remove this once
+// self-hosted is capable enough to handle all of the real start.zig logic.
+pub const simplified_logic =
+    builtin.zig_backend == .stage2_wasm or
+    builtin.zig_backend == .stage2_x86_64 or
+    builtin.zig_backend == .stage2_x86 or
+    builtin.zig_backend == .stage2_aarch64 or
+    builtin.zig_backend == .stage2_arm or
+    builtin.zig_backend == .stage2_riscv64 or
+    builtin.zig_backend == .stage2_sparc64;
+
 comptime {
     // No matter what, we import the root file, so that any export, test, comptime
     // decls there get run.
     _ = root;
 
-    // The self-hosted compiler is not fully capable of handling all of this start.zig file.
-    // Until then, we have simplified logic here for self-hosted. TODO remove this once
-    // self-hosted is capable enough to handle all of the real start.zig logic.
-    if (builtin.zig_backend == .stage2_wasm or
-        builtin.zig_backend == .stage2_x86_64 or
-        builtin.zig_backend == .stage2_x86 or
-        builtin.zig_backend == .stage2_aarch64 or
-        builtin.zig_backend == .stage2_arm or
-        builtin.zig_backend == .stage2_riscv64 or
-        builtin.zig_backend == .stage2_sparc64)
-    {
+    if (simplified_logic) {
         if (builtin.output_mode == .Exe) {
             if ((builtin.link_libc or builtin.object_format == .c) and @hasDecl(root, "main")) {
                 if (@typeInfo(@TypeOf(root.main)).Fn.calling_convention != .C) {
@@ -327,7 +329,7 @@ fn _start() callconv(.Naked) noreturn {
                     : [argc] "={sp}" (-> [*]usize),
                 );
             },
-            .mips, .mipsel => {
+            .mips, .mipsel, .mips64, .mips64el => {
                 // The lr is already zeroed on entry, as specified by the ABI.
                 argc_argv_ptr = asm volatile (
                     \\ move $fp, $0
@@ -437,20 +439,22 @@ fn posixCallMainAndExit() callconv(.C) noreturn {
             std.os.linux.pie.relocate(phdrs);
         }
 
-        // ARMv6 targets (and earlier) have no support for TLS in hardware.
-        // FIXME: Elide the check for targets >= ARMv7 when the target feature API
-        // becomes less verbose (and more usable).
-        if (comptime native_arch.isARM()) {
-            if (at_hwcap & std.os.linux.HWCAP.TLS == 0) {
-                // FIXME: Make __aeabi_read_tp call the kernel helper kuser_get_tls
-                // For the time being use a simple abort instead of a @panic call to
-                // keep the binary bloat under control.
-                std.os.abort();
+        if (!builtin.single_threaded) {
+            // ARMv6 targets (and earlier) have no support for TLS in hardware.
+            // FIXME: Elide the check for targets >= ARMv7 when the target feature API
+            // becomes less verbose (and more usable).
+            if (comptime native_arch.isARM()) {
+                if (at_hwcap & std.os.linux.HWCAP.TLS == 0) {
+                    // FIXME: Make __aeabi_read_tp call the kernel helper kuser_get_tls
+                    // For the time being use a simple abort instead of a @panic call to
+                    // keep the binary bloat under control.
+                    std.os.abort();
+                }
             }
-        }
 
-        // Initialize the TLS area.
-        std.os.linux.tls.initStaticTLS(phdrs);
+            // Initialize the TLS area.
+            std.os.linux.tls.initStaticTLS(phdrs);
+        }
 
         // The way Linux executables represent stack size is via the PT_GNU_STACK
         // program header. However the kernel does not recognize it; it always gives 8 MiB.
@@ -494,6 +498,7 @@ fn callMainWithArgs(argc: usize, argv: [*][*:0]u8, envp: [][*:0]u8) u8 {
     std.os.environ = envp;
 
     std.debug.maybeEnableSegfaultHandler();
+    std.os.maybeIgnoreSigpipe();
 
     return initEventLoopAndCallMain();
 }
@@ -525,7 +530,7 @@ const bad_main_ret = "expected return type of main to be 'void', '!void', 'noret
 // and we want fewer call frames in stack traces.
 inline fn initEventLoopAndCallMain() u8 {
     if (std.event.Loop.instance) |loop| {
-        if (!@hasDecl(root, "event_loop")) {
+        if (loop == std.event.Loop.default_instance) {
             loop.init() catch |err| {
                 std.log.err("{s}", .{@errorName(err)});
                 if (@errorReturnTrace()) |trace| {
@@ -554,7 +559,7 @@ inline fn initEventLoopAndCallMain() u8 {
 // because it is working around stage1 compiler bugs.
 inline fn initEventLoopAndCallWinMain() std.os.windows.INT {
     if (std.event.Loop.instance) |loop| {
-        if (!@hasDecl(root, "event_loop")) {
+        if (loop == std.event.Loop.default_instance) {
             loop.init() catch |err| {
                 std.log.err("{s}", .{@errorName(err)});
                 if (@errorReturnTrace()) |trace| {

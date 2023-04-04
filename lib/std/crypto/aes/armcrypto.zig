@@ -32,62 +32,54 @@ pub const Block = struct {
     /// Encrypt a block with a round key.
     pub inline fn encrypt(block: Block, round_key: Block) Block {
         return Block{
-            .repr = asm (
+            .repr = (asm (
                 \\ mov   %[out].16b, %[in].16b
                 \\ aese  %[out].16b, %[zero].16b
                 \\ aesmc %[out].16b, %[out].16b
-                \\ eor   %[out].16b, %[out].16b, %[rk].16b
                 : [out] "=&x" (-> BlockVec),
                 : [in] "x" (block.repr),
-                  [rk] "x" (round_key.repr),
                   [zero] "x" (zero),
-            ),
+            )) ^ round_key.repr,
         };
     }
 
     /// Encrypt a block with the last round key.
     pub inline fn encryptLast(block: Block, round_key: Block) Block {
         return Block{
-            .repr = asm (
+            .repr = (asm (
                 \\ mov   %[out].16b, %[in].16b
                 \\ aese  %[out].16b, %[zero].16b
-                \\ eor   %[out].16b, %[out].16b, %[rk].16b
                 : [out] "=&x" (-> BlockVec),
                 : [in] "x" (block.repr),
-                  [rk] "x" (round_key.repr),
                   [zero] "x" (zero),
-            ),
+            )) ^ round_key.repr,
         };
     }
 
     /// Decrypt a block with a round key.
     pub inline fn decrypt(block: Block, inv_round_key: Block) Block {
         return Block{
-            .repr = asm (
+            .repr = (asm (
                 \\ mov   %[out].16b, %[in].16b
                 \\ aesd  %[out].16b, %[zero].16b
                 \\ aesimc %[out].16b, %[out].16b
-                \\ eor   %[out].16b, %[out].16b, %[rk].16b
                 : [out] "=&x" (-> BlockVec),
                 : [in] "x" (block.repr),
-                  [rk] "x" (inv_round_key.repr),
                   [zero] "x" (zero),
-            ),
+            )) ^ inv_round_key.repr,
         };
     }
 
     /// Decrypt a block with the last round key.
     pub inline fn decryptLast(block: Block, inv_round_key: Block) Block {
         return Block{
-            .repr = asm (
+            .repr = (asm (
                 \\ mov   %[out].16b, %[in].16b
                 \\ aesd  %[out].16b, %[zero].16b
-                \\ eor   %[out].16b, %[out].16b, %[rk].16b
                 : [out] "=&x" (-> BlockVec),
                 : [in] "x" (block.repr),
-                  [rk] "x" (inv_round_key.repr),
                   [zero] "x" (zero),
-            ),
+            )) ^ inv_round_key.repr,
         };
     }
 
@@ -250,7 +242,7 @@ fn KeySchedule(comptime Aes: type) type {
         fn expand128(t1: *Block) Self {
             var round_keys: [11]Block = undefined;
             const rcs = [_]u8{ 1, 2, 4, 8, 16, 32, 64, 128, 27, 54 };
-            inline for (rcs) |rc, round| {
+            inline for (rcs, 0..) |rc, round| {
                 round_keys[round] = t1.*;
                 t1.repr = drc128(rc, t1.repr);
             }
@@ -262,7 +254,7 @@ fn KeySchedule(comptime Aes: type) type {
             var round_keys: [15]Block = undefined;
             const rcs = [_]u8{ 1, 2, 4, 8, 16, 32 };
             round_keys[0] = t1.*;
-            inline for (rcs) |rc, round| {
+            inline for (rcs, 0..) |rc, round| {
                 round_keys[round * 2 + 1] = t2.*;
                 t1.repr = drc256(false, rc, t2.repr, t1.repr);
                 round_keys[round * 2 + 2] = t1.*;

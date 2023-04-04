@@ -19,8 +19,8 @@ const Mir = @import("Mir.zig");
 const Emit = @import("Emit.zig");
 const Liveness = @import("../../Liveness.zig");
 const Type = @import("../../type.zig").Type;
-const GenerateSymbolError = @import("../../codegen.zig").GenerateSymbolError;
-const FnResult = @import("../../codegen.zig").FnResult;
+const CodeGenError = codegen.CodeGenError;
+const Result = @import("../../codegen.zig").Result;
 const DebugInfoOutput = @import("../../codegen.zig").DebugInfoOutput;
 
 const build_options = @import("build_options");
@@ -38,11 +38,7 @@ const gp = abi.RegisterClass.gp;
 
 const Self = @This();
 
-const InnerError = error{
-    OutOfMemory,
-    CodegenFail,
-    OutOfRegisters,
-};
+const InnerError = CodeGenError || error{OutOfRegisters};
 
 const RegisterView = enum(u1) {
     caller,
@@ -265,7 +261,7 @@ pub fn generate(
     liveness: Liveness,
     code: *std.ArrayList(u8),
     debug_output: DebugInfoOutput,
-) GenerateSymbolError!FnResult {
+) CodeGenError!Result {
     if (build_options.skip_non_native and builtin.cpu.arch != bin_file.options.target.cpu.arch) {
         @panic("Attempted to compile for architecture that was disabled by build configuration");
     }
@@ -310,8 +306,8 @@ pub fn generate(
     defer function.exitlude_jump_relocs.deinit(bin_file.allocator);
 
     var call_info = function.resolveCallingConventionValues(fn_type, .callee) catch |err| switch (err) {
-        error.CodegenFail => return FnResult{ .fail = function.err_msg.? },
-        error.OutOfRegisters => return FnResult{
+        error.CodegenFail => return Result{ .fail = function.err_msg.? },
+        error.OutOfRegisters => return Result{
             .fail = try ErrorMsg.create(bin_file.allocator, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
         },
         else => |e| return e,
@@ -324,8 +320,8 @@ pub fn generate(
     function.max_end_stack = call_info.stack_byte_count;
 
     function.gen() catch |err| switch (err) {
-        error.CodegenFail => return FnResult{ .fail = function.err_msg.? },
-        error.OutOfRegisters => return FnResult{
+        error.CodegenFail => return Result{ .fail = function.err_msg.? },
+        error.OutOfRegisters => return Result{
             .fail = try ErrorMsg.create(bin_file.allocator, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
         },
         else => |e| return e,
@@ -351,14 +347,14 @@ pub fn generate(
     defer emit.deinit();
 
     emit.emitMir() catch |err| switch (err) {
-        error.EmitFail => return FnResult{ .fail = emit.err_msg.? },
+        error.EmitFail => return Result{ .fail = emit.err_msg.? },
         else => |e| return e,
     };
 
     if (function.err_msg) |em| {
-        return FnResult{ .fail = em };
+        return Result{ .fail = em };
     } else {
-        return FnResult{ .appended = {} };
+        return Result.ok;
     }
 }
 
@@ -566,6 +562,7 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .bitcast         => try self.airBitCast(inst),
             .block           => try self.airBlock(inst),
             .br              => try self.airBr(inst),
+            .trap            => try self.airTrap(),
             .breakpoint      => try self.airBreakpoint(),
             .ret_addr        => @panic("TODO try self.airRetAddr(inst)"),
             .frame_addr      => @panic("TODO try self.airFrameAddress(inst)"),
@@ -723,6 +720,10 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
 
             .wasm_memory_size => unreachable,
             .wasm_memory_grow => unreachable,
+
+            .work_item_id => unreachable,
+            .work_group_size => unreachable,
+            .work_group_id => unreachable,
             // zig fmt: on
         }
 
@@ -1091,7 +1092,21 @@ fn airPtrArithmetic(self: *Self, inst: Air.Inst.Index, tag: Air.Inst.Tag) !void 
 
 fn airBitCast(self: *Self, inst: Air.Inst.Index) !void {
     const ty_op = self.air.instructions.items(.data)[inst].ty_op;
-    const result = try self.resolveInst(ty_op.operand);
+    const result = if (self.liveness.isUnused(inst)) .dead else result: {
+        const operand = try self.resolveInst(ty_op.operand);
+        if (self.reuseOperand(inst, ty_op.operand, 0, operand)) break :result operand;
+
+        const operand_lock = switch (operand) {
+            .register => |reg| self.register_manager.lockReg(reg),
+            .register_with_overflow => |rwo| self.register_manager.lockReg(rwo.reg),
+            else => null,
+        };
+        defer if (operand_lock) |lock| self.register_manager.unlockReg(lock);
+
+        const dest = try self.allocRegOrMem(inst, true);
+        try self.setRegOrMem(self.air.typeOfIndex(inst), dest, operand);
+        break :result dest;
+    };
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
 }
 
@@ -1146,6 +1161,21 @@ fn airBr(self: *Self, inst: Air.Inst.Index) !void {
     return self.finishAir(inst, .dead, .{ branch.operand, .none, .none });
 }
 
+fn airTrap(self: *Self) !void {
+    // ta 0x05
+    _ = try self.addInst(.{
+        .tag = .tcc,
+        .data = .{
+            .trap = .{
+                .is_imm = true,
+                .cond = .al,
+                .rs2_or_imm = .{ .imm = 0x05 },
+            },
+        },
+    });
+    return self.finishAirBookkeeping();
+}
+
 fn airBreakpoint(self: *Self) !void {
     // ta 0x01
     _ = try self.addInst(.{
@@ -1189,7 +1219,7 @@ fn airCall(self: *Self, inst: Air.Inst.Index, modifier: std.builtin.CallModifier
         try self.register_manager.getReg(reg, null);
     }
 
-    for (info.args) |mc_arg, arg_i| {
+    for (info.args, 0..) |mc_arg, arg_i| {
         const arg = args[arg_i];
         const arg_ty = self.air.typeOf(arg);
         const arg_mcv = try self.resolveInst(arg);
@@ -1216,12 +1246,10 @@ fn airCall(self: *Self, inst: Air.Inst.Index, modifier: std.builtin.CallModifier
         if (self.bin_file.tag == link.File.Elf.base_tag) {
             if (func_value.castTag(.function)) |func_payload| {
                 const func = func_payload.data;
-                const ptr_bits = self.target.cpu.arch.ptrBitWidth();
-                const ptr_bytes: u64 = @divExact(ptr_bits, 8);
                 const got_addr = if (self.bin_file.cast(link.File.Elf)) |elf_file| blk: {
-                    const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-                    const mod = self.bin_file.options.module.?;
-                    break :blk @intCast(u32, got.p_vaddr + mod.declPtr(func.owner_decl).link.elf.offset_table_index * ptr_bytes);
+                    const atom_index = try elf_file.getOrCreateAtomForDecl(func.owner_decl);
+                    const atom = elf_file.getAtom(atom_index);
+                    break :blk @intCast(u32, atom.getOffsetTableAddress(elf_file));
                 } else unreachable;
 
                 try self.genSetReg(Type.initTag(.usize), .o7, .{ .memory = got_addr });
@@ -1452,7 +1480,7 @@ fn airCondBr(self: *Self, inst: Air.Inst.Index) !void {
     const else_slice = else_branch.inst_table.entries.slice();
     const else_keys = else_slice.items(.key);
     const else_values = else_slice.items(.value);
-    for (else_keys) |else_key, else_idx| {
+    for (else_keys, 0..) |else_key, else_idx| {
         const else_value = else_values[else_idx];
         const canon_mcv = if (saved_then_branch.inst_table.fetchSwapRemove(else_key)) |then_entry| blk: {
             // The instruction's MCValue is overridden in both branches.
@@ -1486,7 +1514,7 @@ fn airCondBr(self: *Self, inst: Air.Inst.Index) !void {
     const then_slice = saved_then_branch.inst_table.entries.slice();
     const then_keys = then_slice.items(.key);
     const then_values = then_slice.items(.value);
-    for (then_keys) |then_key, then_idx| {
+    for (then_keys, 0..) |then_key, then_idx| {
         const then_value = then_values[then_idx];
         // We already deleted the items from this table that matched the else_branch.
         // So these are all instructions that are only overridden in the then branch.
@@ -3414,13 +3442,9 @@ fn genArgDbgInfo(self: Self, inst: Air.Inst.Index, mcv: MCValue) !void {
 
     switch (self.debug_output) {
         .dwarf => |dw| switch (mcv) {
-            .register => |reg| try dw.genArgDbgInfo(
-                name,
-                ty,
-                self.bin_file.tag,
-                self.mod_fn.owner_decl,
-                .{ .register = reg.dwarfLocOp() },
-            ),
+            .register => |reg| try dw.genArgDbgInfo(name, ty, self.mod_fn.owner_decl, .{
+                .register = reg.dwarfLocOp(),
+            }),
             else => {},
         },
         else => {},
@@ -3890,133 +3914,25 @@ fn genStore(self: *Self, value_reg: Register, addr_reg: Register, comptime off_t
 }
 
 fn genTypedValue(self: *Self, typed_value: TypedValue) InnerError!MCValue {
-    var tv = typed_value;
-    log.debug("genTypedValue: ty = {}, val = {}", .{ tv.ty.fmtDebug(), tv.val.fmtDebug() });
-
-    if (tv.val.castTag(.runtime_value)) |rt| {
-        tv.val = rt.data;
-    }
-
-    if (tv.val.isUndef())
-        return MCValue{ .undef = {} };
-
-    if (tv.val.castTag(.decl_ref)) |payload| {
-        return self.lowerDeclRef(tv, payload.data);
-    }
-    if (tv.val.castTag(.decl_ref_mut)) |payload| {
-        return self.lowerDeclRef(tv, payload.data.decl_index);
-    }
-    const target = self.target.*;
-
-    switch (tv.ty.zigTypeTag()) {
-        .Pointer => switch (tv.ty.ptrSize()) {
-            .Slice => {},
-            else => {
-                switch (tv.val.tag()) {
-                    .int_u64 => {
-                        return MCValue{ .immediate = tv.val.toUnsignedInt(target) };
-                    },
-                    else => {},
-                }
-            },
+    const mcv: MCValue = switch (try codegen.genTypedValue(
+        self.bin_file,
+        self.src_loc,
+        typed_value,
+        self.mod_fn.owner_decl,
+    )) {
+        .mcv => |mcv| switch (mcv) {
+            .none => .none,
+            .undef => .undef,
+            .linker_load => unreachable, // TODO
+            .immediate => |imm| .{ .immediate = imm },
+            .memory => |addr| .{ .memory = addr },
         },
-        .Bool => {
-            return MCValue{ .immediate = @boolToInt(tv.val.toBool()) };
+        .fail => |msg| {
+            self.err_msg = msg;
+            return error.CodegenFail;
         },
-        .Int => {
-            const info = tv.ty.intInfo(self.target.*);
-            if (info.bits <= 64) {
-                const unsigned = switch (info.signedness) {
-                    .signed => blk: {
-                        const signed = tv.val.toSignedInt(target);
-                        break :blk @bitCast(u64, signed);
-                    },
-                    .unsigned => tv.val.toUnsignedInt(target),
-                };
-
-                return MCValue{ .immediate = unsigned };
-            } else {
-                return self.fail("TODO implement int genTypedValue of > 64 bits", .{});
-            }
-        },
-        .Optional => {
-            if (tv.ty.isPtrLikeOptional()) {
-                if (tv.val.isNull())
-                    return MCValue{ .immediate = 0 };
-
-                var buf: Type.Payload.ElemType = undefined;
-                return self.genTypedValue(.{
-                    .ty = tv.ty.optionalChild(&buf),
-                    .val = tv.val,
-                });
-            } else if (tv.ty.abiSize(self.target.*) == 1) {
-                return MCValue{ .immediate = @boolToInt(tv.val.isNull()) };
-            }
-        },
-        .Enum => {
-            if (tv.val.castTag(.enum_field_index)) |field_index| {
-                switch (tv.ty.tag()) {
-                    .enum_simple => {
-                        return MCValue{ .immediate = field_index.data };
-                    },
-                    .enum_full, .enum_nonexhaustive => {
-                        const enum_full = tv.ty.cast(Type.Payload.EnumFull).?.data;
-                        if (enum_full.values.count() != 0) {
-                            const tag_val = enum_full.values.keys()[field_index.data];
-                            return self.genTypedValue(.{ .ty = enum_full.tag_ty, .val = tag_val });
-                        } else {
-                            return MCValue{ .immediate = field_index.data };
-                        }
-                    },
-                    else => unreachable,
-                }
-            } else {
-                var int_tag_buffer: Type.Payload.Bits = undefined;
-                const int_tag_ty = tv.ty.intTagType(&int_tag_buffer);
-                return self.genTypedValue(.{ .ty = int_tag_ty, .val = tv.val });
-            }
-        },
-        .ErrorSet => {
-            const err_name = tv.val.castTag(.@"error").?.data.name;
-            const module = self.bin_file.options.module.?;
-            const global_error_set = module.global_error_set;
-            const error_index = global_error_set.get(err_name).?;
-            return MCValue{ .immediate = error_index };
-        },
-        .ErrorUnion => {
-            const error_type = tv.ty.errorUnionSet();
-            const payload_type = tv.ty.errorUnionPayload();
-
-            if (tv.val.castTag(.eu_payload)) |pl| {
-                if (!payload_type.hasRuntimeBits()) {
-                    // We use the error type directly as the type.
-                    return MCValue{ .immediate = 0 };
-                }
-
-                _ = pl;
-                return self.fail("TODO implement error union const of type '{}' (non-error)", .{tv.ty.fmtDebug()});
-            } else {
-                if (!payload_type.hasRuntimeBits()) {
-                    // We use the error type directly as the type.
-                    return self.genTypedValue(.{ .ty = error_type, .val = tv.val });
-                }
-
-                return self.fail("TODO implement error union const of type '{}' (error)", .{tv.ty.fmtDebug()});
-            }
-        },
-        .ComptimeInt => unreachable, // semantic analysis prevents this
-        .ComptimeFloat => unreachable, // semantic analysis prevents this
-        .Type => unreachable,
-        .EnumLiteral => unreachable,
-        .Void => unreachable,
-        .NoReturn => unreachable,
-        .Undefined => unreachable,
-        .Null => unreachable,
-        .Opaque => unreachable,
-        else => {},
-    }
-
-    return self.fail("TODO implement const of type '{}'", .{tv.ty.fmtDebug()});
+    };
+    return mcv;
 }
 
 fn getResolvedInstValue(self: *Self, inst: Air.Inst.Index) MCValue {
@@ -4192,31 +4108,6 @@ fn load(self: *Self, dst_mcv: MCValue, ptr: MCValue, ptr_ty: Type) InnerError!vo
     }
 }
 
-fn lowerDeclRef(self: *Self, tv: TypedValue, decl_index: Module.Decl.Index) InnerError!MCValue {
-    const ptr_bits = self.target.cpu.arch.ptrBitWidth();
-    const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-
-    // TODO this feels clunky. Perhaps we should check for it in `genTypedValue`?
-    if (tv.ty.zigTypeTag() == .Pointer) blk: {
-        if (tv.ty.castPtrToFn()) |_| break :blk;
-        if (!tv.ty.elemType2().hasRuntimeBits()) {
-            return MCValue.none;
-        }
-    }
-
-    const mod = self.bin_file.options.module.?;
-    const decl = mod.declPtr(decl_index);
-
-    mod.markDeclAlive(decl);
-    if (self.bin_file.cast(link.File.Elf)) |elf_file| {
-        const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-        const got_addr = got.p_vaddr + decl.link.elf.offset_table_index * ptr_bytes;
-        return MCValue{ .memory = got_addr };
-    } else {
-        return self.fail("TODO codegen non-ELF const Decl pointer", .{});
-    }
-}
-
 fn minMax(
     self: *Self,
     tag: Air.Inst.Tag,
@@ -4372,7 +4263,7 @@ fn resolveCallingConventionValues(self: *Self, fn_ty: Type, role: RegisterView) 
                 .callee => abi.c_abi_int_param_regs_callee_view,
             };
 
-            for (param_types) |ty, i| {
+            for (param_types, 0..) |ty, i| {
                 const param_size = @intCast(u32, ty.abiSize(self.target.*));
                 if (param_size <= 8) {
                     if (next_register < argument_registers.len) {

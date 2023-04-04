@@ -5,8 +5,10 @@ const BOOL = windows.BOOL;
 const BOOLEAN = windows.BOOLEAN;
 const CONDITION_VARIABLE = windows.CONDITION_VARIABLE;
 const CONSOLE_SCREEN_BUFFER_INFO = windows.CONSOLE_SCREEN_BUFFER_INFO;
+const CONTEXT = windows.CONTEXT;
 const COORD = windows.COORD;
 const DWORD = windows.DWORD;
+const DWORD64 = windows.DWORD64;
 const FILE_INFO_BY_HANDLE_CLASS = windows.FILE_INFO_BY_HANDLE_CLASS;
 const HANDLE = windows.HANDLE;
 const HMODULE = windows.HMODULE;
@@ -60,6 +62,12 @@ const INIT_ONCE_FN = windows.INIT_ONCE_FN;
 const PMEMORY_BASIC_INFORMATION = windows.PMEMORY_BASIC_INFORMATION;
 const REGSAM = windows.REGSAM;
 const LSTATUS = windows.LSTATUS;
+const UNWIND_HISTORY_TABLE = windows.UNWIND_HISTORY_TABLE;
+const RUNTIME_FUNCTION = windows.RUNTIME_FUNCTION;
+const KNONVOLATILE_CONTEXT_POINTERS = windows.KNONVOLATILE_CONTEXT_POINTERS;
+const EXCEPTION_ROUTINE = windows.EXCEPTION_ROUTINE;
+const MODULEENTRY32 = windows.MODULEENTRY32;
+const ULONGLONG = windows.ULONGLONG;
 
 pub extern "kernel32" fn AddVectoredExceptionHandler(First: c_ulong, Handler: ?VECTORED_EXCEPTION_HANDLER) callconv(WINAPI) ?*anyopaque;
 pub extern "kernel32" fn RemoveVectoredExceptionHandler(Handle: HANDLE) callconv(WINAPI) c_ulong;
@@ -125,6 +133,8 @@ pub extern "kernel32" fn CreateSymbolicLinkW(lpSymlinkFileName: [*:0]const u16, 
 pub extern "kernel32" fn CreateIoCompletionPort(FileHandle: HANDLE, ExistingCompletionPort: ?HANDLE, CompletionKey: ULONG_PTR, NumberOfConcurrentThreads: DWORD) callconv(WINAPI) ?HANDLE;
 
 pub extern "kernel32" fn CreateThread(lpThreadAttributes: ?*SECURITY_ATTRIBUTES, dwStackSize: SIZE_T, lpStartAddress: LPTHREAD_START_ROUTINE, lpParameter: ?LPVOID, dwCreationFlags: DWORD, lpThreadId: ?*DWORD) callconv(WINAPI) ?HANDLE;
+
+pub extern "kernel32" fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) callconv(WINAPI) HANDLE;
 
 pub extern "kernel32" fn DeviceIoControl(
     h: HANDLE,
@@ -192,11 +202,6 @@ pub extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const WCHAR) callc
 pub extern "kernel32" fn GetLastError() callconv(WINAPI) Win32Error;
 pub extern "kernel32" fn SetLastError(dwErrCode: Win32Error) callconv(WINAPI) void;
 
-pub extern "kernel32" fn GetFileInformationByHandle(
-    hFile: HANDLE,
-    lpFileInformation: *BY_HANDLE_FILE_INFORMATION,
-) callconv(WINAPI) BOOL;
-
 pub extern "kernel32" fn GetFileInformationByHandleEx(
     in_hFile: HANDLE,
     in_FileInformationClass: FILE_INFO_BY_HANDLE_CLASS,
@@ -214,7 +219,7 @@ pub extern "kernel32" fn GetFinalPathNameByHandleW(
 pub extern "kernel32" fn GetFullPathNameW(
     lpFileName: [*:0]const u16,
     nBufferLength: u32,
-    lpBuffer: ?[*:0]u16,
+    lpBuffer: [*]u16,
     lpFilePart: ?*?[*:0]u16,
 ) callconv(@import("std").os.windows.WINAPI) u32;
 
@@ -259,6 +264,10 @@ pub extern "kernel32" fn VirtualQuery(lpAddress: ?LPVOID, lpBuffer: PMEMORY_BASI
 
 pub extern "kernel32" fn LocalFree(hMem: HLOCAL) callconv(WINAPI) ?HLOCAL;
 
+pub extern "kernel32" fn Module32First(hSnapshot: HANDLE, lpme: *MODULEENTRY32) callconv(WINAPI) BOOL;
+
+pub extern "kernel32" fn Module32Next(hSnapshot: HANDLE, lpme: *MODULEENTRY32) callconv(WINAPI) BOOL;
+
 pub extern "kernel32" fn MoveFileExW(
     lpExistingFileName: [*:0]const u16,
     lpNewFileName: [*:0]const u16,
@@ -291,6 +300,25 @@ pub extern "kernel32" fn ReadFile(
 ) callconv(WINAPI) BOOL;
 
 pub extern "kernel32" fn RemoveDirectoryW(lpPathName: [*:0]const u16) callconv(WINAPI) BOOL;
+
+pub extern "kernel32" fn RtlCaptureContext(ContextRecord: *CONTEXT) callconv(WINAPI) void;
+
+pub extern "kernel32" fn RtlLookupFunctionEntry(
+    ControlPc: DWORD64,
+    ImageBase: *DWORD64,
+    HistoryTable: *UNWIND_HISTORY_TABLE,
+) callconv(WINAPI) ?*RUNTIME_FUNCTION;
+
+pub extern "kernel32" fn RtlVirtualUnwind(
+    HandlerType: DWORD,
+    ImageBase: DWORD64,
+    ControlPc: DWORD64,
+    FunctionEntry: *RUNTIME_FUNCTION,
+    ContextRecord: *CONTEXT,
+    HandlerData: *?PVOID,
+    EstablisherFrame: *DWORD64,
+    ContextPointers: ?*KNONVOLATILE_CONTEXT_POINTERS,
+) callconv(WINAPI) *EXCEPTION_ROUTINE;
 
 pub extern "kernel32" fn SetConsoleTextAttribute(hConsoleOutput: HANDLE, wAttributes: WORD) callconv(WINAPI) BOOL;
 
@@ -425,3 +453,5 @@ pub extern "kernel32" fn RegOpenKeyExW(
     samDesired: REGSAM,
     phkResult: *HKEY,
 ) callconv(WINAPI) LSTATUS;
+
+pub extern "kernel32" fn GetPhysicallyInstalledSystemMemory(TotalMemoryInKilobytes: *ULONGLONG) BOOL;

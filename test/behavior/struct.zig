@@ -342,7 +342,6 @@ fn testPassSliceOfEmptyStructToFn(slice: []const EmptyStruct2) usize {
 test "self-referencing struct via array member" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const T = struct {
@@ -388,7 +387,6 @@ const APackedStruct = packed struct {
 test "packed struct" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     var foo = APackedStruct{
@@ -497,7 +495,6 @@ const Bitfields = packed struct {
 test "packed struct fields are ordered from LSB to MSB" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     var all: u64 = 0x7765443322221111;
@@ -536,7 +533,6 @@ test "implicit cast packed struct field to const ptr" {
 }
 
 test "zero-bit field in packed struct" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const S = packed struct {
@@ -634,7 +630,6 @@ test "default struct initialization fields" {
 }
 
 test "packed array 24bits" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -719,7 +714,6 @@ test "pointer to packed struct member in a stack variable" {
 }
 
 test "packed struct with u0 field access" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const S = packed struct {
@@ -806,7 +800,6 @@ test "fn with C calling convention returns struct by value" {
 }
 
 test "non-packed struct with u128 entry in union" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -830,7 +823,6 @@ test "non-packed struct with u128 entry in union" {
 }
 
 test "packed struct field passed to generic function" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -942,7 +934,6 @@ test "comptime struct field" {
 }
 
 test "tuple element initialized with fn call" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -1018,7 +1009,6 @@ test "type coercion of anon struct literal to struct" {
 }
 
 test "type coercion of pointer to anon struct literal to pointer to struct" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -1088,7 +1078,6 @@ test "packed struct with undefined initializers" {
 }
 
 test "for loop over pointers to struct, getting field from struct pointer" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1154,7 +1143,6 @@ test "anon init through error unions and optionals" {
 }
 
 test "anon init through optional" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -1255,7 +1243,6 @@ test "loading a struct pointer perfoms a copy" {
 }
 
 test "packed struct aggregate init" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -1330,7 +1317,6 @@ test "struct field init value is size of the struct" {
 }
 
 test "under-aligned struct field" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
@@ -1462,7 +1448,6 @@ test "struct has only one reference" {
 test "no dependency loop on pointer to optional struct" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
 
     const S = struct {
         const A = struct { b: B };
@@ -1515,7 +1500,6 @@ test "no dependency loop on optional field wrapped in generic function" {
 }
 
 test "optional field init with tuple" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
 
@@ -1554,4 +1538,62 @@ test "optional generic function label struct field" {
         }
     };
     try expect((Options{}).isFoo.?(u8) == 123);
+}
+
+test "struct fields get automatically reordered" {
+    if (builtin.zig_backend != .stage2_llvm) return error.SkipZigTest; // TODO
+
+    const S1 = struct {
+        a: u32,
+        b: u32,
+        c: bool,
+        d: bool,
+    };
+    const S2 = struct {
+        a: u32,
+        b: bool,
+        c: u32,
+        d: bool,
+    };
+    try expect(@sizeOf(S1) == @sizeOf(S2));
+}
+
+test "directly initiating tuple like struct" {
+    const a = struct { u8 }{8};
+    try expect(a[0] == 8);
+}
+
+test "instantiate struct with comptime field" {
+    {
+        var things = struct {
+            comptime foo: i8 = 1,
+        }{};
+
+        comptime std.debug.assert(things.foo == 1);
+    }
+
+    {
+        const T = struct {
+            comptime foo: i8 = 1,
+        };
+        var things = T{};
+
+        comptime std.debug.assert(things.foo == 1);
+    }
+
+    {
+        var things: struct {
+            comptime foo: i8 = 1,
+        } = .{};
+
+        comptime std.debug.assert(things.foo == 1);
+    }
+
+    {
+        var things: struct {
+            comptime foo: i8 = 1,
+        } = undefined; // Segmentation fault at address 0x0
+
+        comptime std.debug.assert(things.foo == 1);
+    }
 }

@@ -21,10 +21,11 @@ const DW = std.dwarf;
 const leb128 = std.leb;
 const log = std.log.scoped(.codegen);
 const build_options = @import("build_options");
+const codegen = @import("../../codegen.zig");
 
-const FnResult = @import("../../codegen.zig").FnResult;
-const GenerateSymbolError = @import("../../codegen.zig").GenerateSymbolError;
-const DebugInfoOutput = @import("../../codegen.zig").DebugInfoOutput;
+const CodeGenError = codegen.CodeGenError;
+const Result = codegen.Result;
+const DebugInfoOutput = codegen.DebugInfoOutput;
 
 const bits = @import("bits.zig");
 const abi = @import("abi.zig");
@@ -35,11 +36,7 @@ const Instruction = abi.Instruction;
 const callee_preserved_regs = abi.callee_preserved_regs;
 const gp = abi.RegisterClass.gp;
 
-const InnerError = error{
-    OutOfMemory,
-    CodegenFail,
-    OutOfRegisters,
-};
+const InnerError = CodeGenError || error{OutOfRegisters};
 
 gpa: Allocator,
 air: Air,
@@ -225,7 +222,7 @@ pub fn generate(
     liveness: Liveness,
     code: *std.ArrayList(u8),
     debug_output: DebugInfoOutput,
-) GenerateSymbolError!FnResult {
+) CodeGenError!Result {
     if (build_options.skip_non_native and builtin.cpu.arch != bin_file.options.target.cpu.arch) {
         @panic("Attempted to compile for architecture that was disabled by build configuration");
     }
@@ -268,8 +265,8 @@ pub fn generate(
     defer function.exitlude_jump_relocs.deinit(bin_file.allocator);
 
     var call_info = function.resolveCallingConventionValues(fn_type) catch |err| switch (err) {
-        error.CodegenFail => return FnResult{ .fail = function.err_msg.? },
-        error.OutOfRegisters => return FnResult{
+        error.CodegenFail => return Result{ .fail = function.err_msg.? },
+        error.OutOfRegisters => return Result{
             .fail = try ErrorMsg.create(bin_file.allocator, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
         },
         else => |e| return e,
@@ -282,8 +279,8 @@ pub fn generate(
     function.max_end_stack = call_info.stack_byte_count;
 
     function.gen() catch |err| switch (err) {
-        error.CodegenFail => return FnResult{ .fail = function.err_msg.? },
-        error.OutOfRegisters => return FnResult{
+        error.CodegenFail => return Result{ .fail = function.err_msg.? },
+        error.OutOfRegisters => return Result{
             .fail = try ErrorMsg.create(bin_file.allocator, src_loc, "CodeGen ran out of registers. This is a bug in the Zig compiler.", .{}),
         },
         else => |e| return e,
@@ -309,14 +306,14 @@ pub fn generate(
     defer emit.deinit();
 
     emit.emitMir() catch |err| switch (err) {
-        error.EmitFail => return FnResult{ .fail = emit.err_msg.? },
+        error.EmitFail => return Result{ .fail = emit.err_msg.? },
         else => |e| return e,
     };
 
     if (function.err_msg) |em| {
-        return FnResult{ .fail = em };
+        return Result{ .fail = em };
     } else {
-        return FnResult{ .appended = {} };
+        return Result.ok;
     }
 }
 
@@ -550,6 +547,7 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .bitcast         => try self.airBitCast(inst),
             .block           => try self.airBlock(inst),
             .br              => try self.airBr(inst),
+            .trap            => try self.airTrap(),
             .breakpoint      => try self.airBreakpoint(),
             .ret_addr        => try self.airRetAddr(inst),
             .frame_addr      => try self.airFrameAddress(inst),
@@ -706,6 +704,10 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
 
             .wasm_memory_size => unreachable,
             .wasm_memory_grow => unreachable,
+
+            .work_item_id => unreachable,
+            .work_group_size => unreachable,
+            .work_group_id => unreachable,
             // zig fmt: on
         }
         if (std.debug.runtime_safety) {
@@ -1615,13 +1617,9 @@ fn genArgDbgInfo(self: Self, inst: Air.Inst.Index, mcv: MCValue) !void {
 
     switch (self.debug_output) {
         .dwarf => |dw| switch (mcv) {
-            .register => |reg| try dw.genArgDbgInfo(
-                name,
-                ty,
-                self.bin_file.tag,
-                self.mod_fn.owner_decl,
-                .{ .register = reg.dwarfLocOp() },
-            ),
+            .register => |reg| try dw.genArgDbgInfo(name, ty, self.mod_fn.owner_decl, .{
+                .register = reg.dwarfLocOp(),
+            }),
             .stack_offset => {},
             else => {},
         },
@@ -1654,6 +1652,14 @@ fn airArg(self: *Self, inst: Air.Inst.Index) !void {
     }
 
     return self.finishAir(inst, mcv, .{ .none, .none, .none });
+}
+
+fn airTrap(self: *Self) !void {
+    _ = try self.addInst(.{
+        .tag = .unimp,
+        .data = .{ .nop = {} },
+    });
+    return self.finishAirBookkeeping();
 }
 
 fn airBreakpoint(self: *Self) !void {
@@ -1693,7 +1699,7 @@ fn airCall(self: *Self, inst: Air.Inst.Index, modifier: std.builtin.CallModifier
     // Due to incremental compilation, how function calls are generated depends
     // on linking.
     if (self.bin_file.cast(link.File.Elf)) |elf_file| {
-        for (info.args) |mc_arg, arg_i| {
+        for (info.args, 0..) |mc_arg, arg_i| {
             const arg = args[arg_i];
             const arg_ty = self.air.typeOf(arg);
             const arg_mcv = try self.resolveInst(args[arg_i]);
@@ -1721,16 +1727,9 @@ fn airCall(self: *Self, inst: Air.Inst.Index, modifier: std.builtin.CallModifier
         if (self.air.value(callee)) |func_value| {
             if (func_value.castTag(.function)) |func_payload| {
                 const func = func_payload.data;
-
-                const ptr_bits = self.target.cpu.arch.ptrBitWidth();
-                const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-                const mod = self.bin_file.options.module.?;
-                const fn_owner_decl = mod.declPtr(func.owner_decl);
-                const got_addr = blk: {
-                    const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-                    break :blk @intCast(u32, got.p_vaddr + fn_owner_decl.link.elf.offset_table_index * ptr_bytes);
-                };
-
+                const atom_index = try elf_file.getOrCreateAtomForDecl(func.owner_decl);
+                const atom = elf_file.getAtom(atom_index);
+                const got_addr = @intCast(u32, atom.getOffsetTableAddress(elf_file));
                 try self.genSetReg(Type.initTag(.usize), .ra, .{ .memory = got_addr });
                 _ = try self.addInst(.{
                     .tag = .jalr,
@@ -2349,7 +2348,20 @@ fn airPtrToInt(self: *Self, inst: Air.Inst.Index) !void {
 
 fn airBitCast(self: *Self, inst: Air.Inst.Index) !void {
     const ty_op = self.air.instructions.items(.data)[inst].ty_op;
-    const result = try self.resolveInst(ty_op.operand);
+    const result = if (self.liveness.isUnused(inst)) .dead else result: {
+        const operand = try self.resolveInst(ty_op.operand);
+        if (self.reuseOperand(inst, ty_op.operand, 0, operand)) break :result operand;
+
+        const operand_lock = switch (operand) {
+            .register => |reg| self.register_manager.lockReg(reg),
+            else => null,
+        };
+        defer if (operand_lock) |lock| self.register_manager.unlockReg(lock);
+
+        const dest = try self.allocRegOrMem(inst, true);
+        try self.setRegOrMem(self.air.typeOfIndex(inst), dest, operand);
+        break :result dest;
+    };
     return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
 }
 
@@ -2550,146 +2562,26 @@ fn getResolvedInstValue(self: *Self, inst: Air.Inst.Index) MCValue {
     }
 }
 
-fn lowerDeclRef(self: *Self, tv: TypedValue, decl_index: Module.Decl.Index) InnerError!MCValue {
-    const ptr_bits = self.target.cpu.arch.ptrBitWidth();
-    const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-    const mod = self.bin_file.options.module.?;
-    const decl = mod.declPtr(decl_index);
-    mod.markDeclAlive(decl);
-    if (self.bin_file.cast(link.File.Elf)) |elf_file| {
-        const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-        const got_addr = got.p_vaddr + decl.link.elf.offset_table_index * ptr_bytes;
-        return MCValue{ .memory = got_addr };
-    } else if (self.bin_file.cast(link.File.MachO)) |_| {
-        // TODO I'm hacking my way through here by repurposing .memory for storing
-        // index to the GOT target symbol index.
-        return MCValue{ .memory = decl.link.macho.sym_index };
-    } else if (self.bin_file.cast(link.File.Coff)) |_| {
-        return self.fail("TODO codegen COFF const Decl pointer", .{});
-    } else if (self.bin_file.cast(link.File.Plan9)) |p9| {
-        try p9.seeDecl(decl_index);
-        const got_addr = p9.bases.data + decl.link.plan9.got_index.? * ptr_bytes;
-        return MCValue{ .memory = got_addr };
-    } else {
-        return self.fail("TODO codegen non-ELF const Decl pointer", .{});
-    }
-    _ = tv;
-}
-
 fn genTypedValue(self: *Self, typed_value: TypedValue) InnerError!MCValue {
-    if (typed_value.val.isUndef())
-        return MCValue{ .undef = {} };
-
-    if (typed_value.val.castTag(.decl_ref)) |payload| {
-        return self.lowerDeclRef(typed_value, payload.data);
-    }
-    if (typed_value.val.castTag(.decl_ref_mut)) |payload| {
-        return self.lowerDeclRef(typed_value, payload.data.decl_index);
-    }
-    const target = self.target.*;
-    const ptr_bits = self.target.cpu.arch.ptrBitWidth();
-    switch (typed_value.ty.zigTypeTag()) {
-        .Pointer => switch (typed_value.ty.ptrSize()) {
-            .Slice => {
-                var buf: Type.SlicePtrFieldTypeBuffer = undefined;
-                const ptr_type = typed_value.ty.slicePtrFieldType(&buf);
-                const ptr_mcv = try self.genTypedValue(.{ .ty = ptr_type, .val = typed_value.val });
-                const mod = self.bin_file.options.module.?;
-                const slice_len = typed_value.val.sliceLen(mod);
-                // Codegen can't handle some kinds of indirection. If the wrong union field is accessed here it may mean
-                // the Sema code needs to use anonymous Decls or alloca instructions to store data.
-                const ptr_imm = ptr_mcv.memory;
-                _ = slice_len;
-                _ = ptr_imm;
-                // We need more general support for const data being stored in memory to make this work.
-                return self.fail("TODO codegen for const slices", .{});
-            },
-            else => {
-                if (typed_value.val.tag() == .int_u64) {
-                    return MCValue{ .immediate = typed_value.val.toUnsignedInt(target) };
-                }
-                return self.fail("TODO codegen more kinds of const pointers", .{});
-            },
+    const mcv: MCValue = switch (try codegen.genTypedValue(
+        self.bin_file,
+        self.src_loc,
+        typed_value,
+        self.mod_fn.owner_decl,
+    )) {
+        .mcv => |mcv| switch (mcv) {
+            .none => .none,
+            .undef => .undef,
+            .linker_load => unreachable, // TODO
+            .immediate => |imm| .{ .immediate = imm },
+            .memory => |addr| .{ .memory = addr },
         },
-        .Int => {
-            const info = typed_value.ty.intInfo(self.target.*);
-            if (info.bits > ptr_bits or info.signedness == .signed) {
-                return self.fail("TODO const int bigger than ptr and signed int", .{});
-            }
-            return MCValue{ .immediate = typed_value.val.toUnsignedInt(target) };
+        .fail => |msg| {
+            self.err_msg = msg;
+            return error.CodegenFail;
         },
-        .Bool => {
-            return MCValue{ .immediate = @boolToInt(typed_value.val.toBool()) };
-        },
-        .ComptimeInt => unreachable, // semantic analysis prevents this
-        .ComptimeFloat => unreachable, // semantic analysis prevents this
-        .Optional => {
-            if (typed_value.ty.isPtrLikeOptional()) {
-                if (typed_value.val.isNull())
-                    return MCValue{ .immediate = 0 };
-
-                var buf: Type.Payload.ElemType = undefined;
-                return self.genTypedValue(.{
-                    .ty = typed_value.ty.optionalChild(&buf),
-                    .val = typed_value.val,
-                });
-            } else if (typed_value.ty.abiSize(self.target.*) == 1) {
-                return MCValue{ .immediate = @boolToInt(typed_value.val.isNull()) };
-            }
-            return self.fail("TODO non pointer optionals", .{});
-        },
-        .Enum => {
-            if (typed_value.val.castTag(.enum_field_index)) |field_index| {
-                switch (typed_value.ty.tag()) {
-                    .enum_simple => {
-                        return MCValue{ .immediate = field_index.data };
-                    },
-                    .enum_full, .enum_nonexhaustive => {
-                        const enum_full = typed_value.ty.cast(Type.Payload.EnumFull).?.data;
-                        if (enum_full.values.count() != 0) {
-                            const tag_val = enum_full.values.keys()[field_index.data];
-                            return self.genTypedValue(.{ .ty = enum_full.tag_ty, .val = tag_val });
-                        } else {
-                            return MCValue{ .immediate = field_index.data };
-                        }
-                    },
-                    else => unreachable,
-                }
-            } else {
-                var int_tag_buffer: Type.Payload.Bits = undefined;
-                const int_tag_ty = typed_value.ty.intTagType(&int_tag_buffer);
-                return self.genTypedValue(.{ .ty = int_tag_ty, .val = typed_value.val });
-            }
-        },
-        .ErrorSet => {
-            switch (typed_value.val.tag()) {
-                .@"error" => {
-                    const err_name = typed_value.val.castTag(.@"error").?.data.name;
-                    const module = self.bin_file.options.module.?;
-                    const global_error_set = module.global_error_set;
-                    const error_index = global_error_set.get(err_name).?;
-                    return MCValue{ .immediate = error_index };
-                },
-                else => {
-                    // In this case we are rendering an error union which has a 0 bits payload.
-                    return MCValue{ .immediate = 0 };
-                },
-            }
-        },
-        .ErrorUnion => {
-            const error_type = typed_value.ty.errorUnionSet();
-            const payload_type = typed_value.ty.errorUnionPayload();
-            const sub_val = typed_value.val.castTag(.eu_payload).?.data;
-
-            if (!payload_type.hasRuntimeBits()) {
-                // We use the error type directly as the type.
-                return self.genTypedValue(.{ .ty = error_type, .val = sub_val });
-            }
-
-            return self.fail("TODO implement error union const of type '{}'", .{typed_value.ty.fmtDebug()});
-        },
-        else => return self.fail("TODO implement const of type '{}'", .{typed_value.ty.fmtDebug()}),
-    }
+    };
+    return mcv;
 }
 
 const CallMCValues = struct {
@@ -2739,7 +2631,7 @@ fn resolveCallingConventionValues(self: *Self, fn_ty: Type) !CallMCValues {
             var next_stack_offset: u32 = 0;
             const argument_registers = [_]Register{ .a0, .a1, .a2, .a3, .a4, .a5, .a6, .a7 };
 
-            for (param_types) |ty, i| {
+            for (param_types, 0..) |ty, i| {
                 const param_size = @intCast(u32, ty.abiSize(self.target.*));
                 if (param_size <= 8) {
                     if (next_register < argument_registers.len) {

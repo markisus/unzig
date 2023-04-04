@@ -1,19 +1,19 @@
 const std = @import("std");
-const Builder = std.build.Builder;
-const LibExeObjectStep = std.build.LibExeObjStep;
 
-pub fn build(b: *Builder) void {
-    const mode = b.standardReleaseOptions();
+pub const requires_symlinks = true;
+
+pub fn build(b: *std.Build) void {
+    const optimize: std.builtin.OptimizeMode = .Debug;
     const target: std.zig.CrossTarget = .{ .os_tag = .macos };
 
     const test_step = b.step("test", "Test the program");
-    test_step.dependOn(b.getInstallStep());
+    b.default_step = test_step;
 
     {
         // Without -dead_strip, we expect `iAmUnused` symbol present
-        const exe = createScenario(b, mode, target);
+        const exe = createScenario(b, optimize, target, "no-gc");
 
-        const check = exe.checkObject(.macho);
+        const check = exe.checkObject();
         check.checkInSymtab();
         check.checkNext("{*} (__TEXT,__text) external _iAmUnused");
 
@@ -24,10 +24,10 @@ pub fn build(b: *Builder) void {
 
     {
         // With -dead_strip, no `iAmUnused` symbol should be present
-        const exe = createScenario(b, mode, target);
+        const exe = createScenario(b, optimize, target, "yes-gc");
         exe.link_gc_sections = true;
 
-        const check = exe.checkObject(.macho);
+        const check = exe.checkObject();
         check.checkInSymtab();
         check.checkNotPresent("{*} (__TEXT,__text) external _iAmUnused");
 
@@ -37,11 +37,18 @@ pub fn build(b: *Builder) void {
     }
 }
 
-fn createScenario(b: *Builder, mode: std.builtin.Mode, target: std.zig.CrossTarget) *LibExeObjectStep {
-    const exe = b.addExecutable("test", null);
+fn createScenario(
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    target: std.zig.CrossTarget,
+    name: []const u8,
+) *std.Build.CompileStep {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .optimize = optimize,
+        .target = target,
+    });
     exe.addCSourceFile("main.c", &[0][]const u8{});
-    exe.setBuildMode(mode);
-    exe.setTarget(target);
     exe.linkLibC();
     return exe;
 }

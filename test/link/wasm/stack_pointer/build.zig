@@ -1,22 +1,31 @@
 const std = @import("std");
-const Builder = std.build.Builder;
 
-pub fn build(b: *Builder) void {
-    const mode = b.standardReleaseOptions();
+pub const requires_stage2 = true;
 
-    const test_step = b.step("test", "Test");
-    test_step.dependOn(b.getInstallStep());
+pub fn build(b: *std.Build) void {
+    const test_step = b.step("test", "Test it");
+    b.default_step = test_step;
 
-    const lib = b.addSharedLibrary("lib", "lib.zig", .unversioned);
-    lib.setBuildMode(mode);
-    lib.setTarget(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    add(b, test_step, .Debug);
+    add(b, test_step, .ReleaseFast);
+    add(b, test_step, .ReleaseSmall);
+    add(b, test_step, .ReleaseSafe);
+}
+
+fn add(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
+    const lib = b.addSharedLibrary(.{
+        .name = "lib",
+        .root_source_file = .{ .path = "lib.zig" },
+        .target = .{ .cpu_arch = .wasm32, .os_tag = .freestanding },
+        .optimize = optimize,
+    });
     lib.use_llvm = false;
     lib.use_lld = false;
     lib.strip = false;
     lib.stack_size = std.wasm.page_size * 2; // set an explicit stack size
     lib.install();
 
-    const check_lib = lib.checkObject(.wasm);
+    const check_lib = lib.checkObject();
 
     // ensure global exists and its initial value is equal to explitic stack size
     check_lib.checkStart("Section global");

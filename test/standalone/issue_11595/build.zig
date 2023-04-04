@@ -1,22 +1,24 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Builder = std.build.Builder;
-const CrossTarget = std.zig.CrossTarget;
 
-// TODO integrate this with the std.build executor API
-fn isRunnableTarget(t: CrossTarget) bool {
-    if (t.isNative()) return true;
+pub fn build(b: *std.Build) void {
+    const test_step = b.step("test", "Test it");
+    b.default_step = test_step;
 
-    return (t.getOsTag() == builtin.os.tag and
-        t.getCpuArch() == builtin.cpu.arch);
-}
+    const optimize: std.builtin.OptimizeMode = .Debug;
+    const target: std.zig.CrossTarget = .{};
 
-pub fn build(b: *Builder) void {
-    const mode = b.standardReleaseOptions();
-    const target = b.standardTargetOptions(.{});
+    if (builtin.os.tag == .windows) {
+        // https://github.com/ziglang/zig/issues/12419
+        return;
+    }
 
-    const exe = b.addExecutable("zigtest", "main.zig");
-    exe.setBuildMode(mode);
+    const exe = b.addExecutable(.{
+        .name = "zigtest",
+        .root_source_file = .{ .path = "main.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
     exe.install();
 
     const c_sources = [_][]const u8{
@@ -39,14 +41,11 @@ pub fn build(b: *Builder) void {
     exe.defineCMacro("QUX", "\"Q\" \"UX\"");
     exe.defineCMacro("QUUX", "\"QU\\\"UX\"");
 
-    exe.setTarget(target);
     b.default_step.dependOn(&exe.step);
 
-    const test_step = b.step("test", "Test the program");
-    if (isRunnableTarget(target)) {
-        const run_cmd = exe.run();
-        test_step.dependOn(&run_cmd.step);
-    } else {
-        test_step.dependOn(&exe.step);
-    }
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.skip_foreign_checks = true;
+    run_cmd.expectExitCode(0);
+
+    test_step.dependOn(&run_cmd.step);
 }

@@ -19,6 +19,13 @@ pub const GeneralPurposeAllocator = @import("heap/general_purpose_allocator.zig"
 pub const WasmAllocator = @import("heap/WasmAllocator.zig");
 pub const WasmPageAllocator = @import("heap/WasmPageAllocator.zig");
 pub const PageAllocator = @import("heap/PageAllocator.zig");
+pub const ThreadSafeAllocator = @import("heap/ThreadSafeAllocator.zig");
+
+const memory_pool = @import("heap/memory_pool.zig");
+pub const MemoryPool = memory_pool.MemoryPool;
+pub const MemoryPoolAligned = memory_pool.MemoryPoolAligned;
+pub const MemoryPoolExtra = memory_pool.MemoryPoolExtra;
+pub const MemoryPoolOptions = memory_pool.Options;
 
 /// TODO Utilize this on Windows.
 pub var next_mmap_addr_hint: ?[*]align(mem.page_size) u8 = null;
@@ -718,7 +725,7 @@ pub fn testAllocator(base_allocator: mem.Allocator) !void {
 
     var slice = try allocator.alloc(*i32, 100);
     try testing.expect(slice.len == 100);
-    for (slice) |*item, i| {
+    for (slice, 0..) |*item, i| {
         item.* = try allocator.create(i32);
         item.*.* = @intCast(i32, i);
     }
@@ -726,7 +733,7 @@ pub fn testAllocator(base_allocator: mem.Allocator) !void {
     slice = try allocator.realloc(slice, 20000);
     try testing.expect(slice.len == 20000);
 
-    for (slice[0..100]) |item, i| {
+    for (slice[0..100], 0..) |item, i| {
         try testing.expect(item.* == @intCast(i32, i));
         allocator.destroy(item);
     }
@@ -851,6 +858,7 @@ test {
     _ = LoggingAllocator;
     _ = LogToWriterAllocator;
     _ = ScopedLoggingAllocator;
+    _ = @import("heap/memory_pool.zig");
     _ = ArenaAllocator;
     _ = GeneralPurposeAllocator;
     if (comptime builtin.target.isWasm()) {

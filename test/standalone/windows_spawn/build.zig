@@ -1,16 +1,33 @@
-const Builder = @import("std").build.Builder;
+const std = @import("std");
+const builtin = @import("builtin");
 
-pub fn build(b: *Builder) void {
-    const mode = b.standardReleaseOptions();
-
-    const hello = b.addExecutable("hello", "hello.zig");
-    hello.setBuildMode(mode);
-
-    const main = b.addExecutable("main", "main.zig");
-    main.setBuildMode(mode);
-    const run = main.run();
-    run.addArtifactArg(hello);
-
+pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Test it");
+    b.default_step = test_step;
+
+    const optimize: std.builtin.OptimizeMode = .Debug;
+    const target: std.zig.CrossTarget = .{};
+
+    if (builtin.os.tag != .windows) return;
+
+    const hello = b.addExecutable(.{
+        .name = "hello",
+        .root_source_file = .{ .path = "hello.zig" },
+        .optimize = optimize,
+        .target = target,
+    });
+
+    const main = b.addExecutable(.{
+        .name = "main",
+        .root_source_file = .{ .path = "main.zig" },
+        .optimize = optimize,
+        .target = target,
+    });
+
+    const run = b.addRunArtifact(main);
+    run.addArtifactArg(hello);
+    run.expectExitCode(0);
+    run.skip_foreign_checks = true;
+
     test_step.dependOn(&run.step);
 }

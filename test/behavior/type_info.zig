@@ -509,7 +509,6 @@ test "type info for async frames" {
 }
 
 test "Declarations are returned in declaration order" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const S = struct {
@@ -532,7 +531,6 @@ test "Struct.is_tuple for anon list literal" {
 }
 
 test "Struct.is_tuple for anon struct literal" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const info = @typeInfo(@TypeOf(.{ .a = 0 }));
@@ -565,4 +563,46 @@ test "value from struct @typeInfo default_value can be loaded at comptime" {
         const a = @typeInfo(@TypeOf(.{ .foo = @as(u8, 1) })).Struct.fields[0].default_value;
         try expect(@ptrCast(*const u8, a).* == 1);
     }
+}
+
+test "@typeInfo decls and usingnamespace" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+
+    const A = struct {
+        const x = 5;
+        const y = 34;
+
+        comptime {}
+    };
+    const B = struct {
+        usingnamespace A;
+        const z = 56;
+
+        test {}
+    };
+    const decls = @typeInfo(B).Struct.decls;
+    try expect(decls.len == 3);
+    try expectEqualStrings(decls[0].name, "x");
+    try expectEqualStrings(decls[1].name, "y");
+    try expectEqualStrings(decls[2].name, "z");
+}
+
+test "@typeInfo decls ignore dependency loops" {
+    const S = struct {
+        fn Def(comptime T: type) type {
+            std.debug.assert(@typeInfo(T).Struct.decls.len == 1);
+            return struct {
+                const foo = u32;
+            };
+        }
+        usingnamespace Def(@This());
+    };
+    _ = S.foo;
+}
+
+test "type info of tuple of string literal default value" {
+    const struct_field = @typeInfo(@TypeOf(.{"hi"})).Struct.fields[0];
+    const value = @ptrCast(*align(1) const *const [2:0]u8, struct_field.default_value.?).*;
+    comptime std.debug.assert(value[0] == 'h');
 }

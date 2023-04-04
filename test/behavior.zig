@@ -74,6 +74,7 @@ test {
     _ = @import("behavior/bugs/7047.zig");
     _ = @import("behavior/bugs/7187.zig");
     _ = @import("behavior/bugs/7325.zig");
+    _ = @import("behavior/bugs/8277.zig");
     _ = @import("behavior/bugs/8646.zig");
     _ = @import("behavior/bugs/9584.zig");
     _ = @import("behavior/bugs/10138.zig");
@@ -105,7 +106,6 @@ test {
     _ = @import("behavior/bugs/12430.zig");
     _ = @import("behavior/bugs/12450.zig");
     _ = @import("behavior/bugs/12486.zig");
-    _ = @import("behavior/bugs/12488.zig");
     _ = @import("behavior/bugs/12498.zig");
     _ = @import("behavior/bugs/12551.zig");
     _ = @import("behavior/bugs/12571.zig");
@@ -141,6 +141,7 @@ test {
     _ = @import("behavior/bugs/13664.zig");
     _ = @import("behavior/bugs/13714.zig");
     _ = @import("behavior/bugs/13785.zig");
+    _ = @import("behavior/bugs/14854.zig");
     _ = @import("behavior/byteswap.zig");
     _ = @import("behavior/byval_arg_var.zig");
     _ = @import("behavior/call.zig");
@@ -190,6 +191,7 @@ test {
     _ = @import("behavior/pub_enum.zig");
     _ = @import("behavior/ref_var_in_if_after_if_2nd_switch_prong.zig");
     _ = @import("behavior/reflection.zig");
+    _ = @import("behavior/return_address.zig");
     _ = @import("behavior/saturating_arithmetic.zig");
     _ = @import("behavior/select.zig");
     _ = @import("behavior/shuffle.zig");
@@ -240,6 +242,7 @@ test {
     {
         _ = @import("behavior/bugs/13063.zig");
         _ = @import("behavior/bugs/11227.zig");
+        _ = @import("behavior/bugs/14198.zig");
         _ = @import("behavior/export.zig");
     }
 

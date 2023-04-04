@@ -16,7 +16,7 @@ const Ast = std.zig.Ast;
 
 const Module = @This();
 const Compilation = @import("Compilation.zig");
-const Cache = @import("Cache.zig");
+const Cache = std.Build.Cache;
 const Value = @import("value.zig").Value;
 const Type = @import("type.zig").Type;
 const TypedValue = @import("TypedValue.zig");
@@ -144,10 +144,6 @@ stage1_flags: packed struct {
 } = .{},
 
 job_queued_update_builtin_zig: bool = true,
-/// This makes it so that we can run `zig test` on the standard library.
-/// Otherwise, the logic for scanning test decls skips all of them because
-/// `main_pkg != std_pkg`.
-main_pkg_is_std: bool,
 
 compile_log_text: ArrayListUnmanaged(u8) = .{},
 
@@ -268,7 +264,7 @@ pub const MemoizedCall = struct {
         if (a.func != b.func) return false;
 
         assert(a.args.len == b.args.len);
-        for (a.args) |a_arg, arg_i| {
+        for (a.args, 0..) |a_arg, arg_i| {
             const b_arg = b.args[arg_i];
             if (!a_arg.eql(b_arg, ctx.module)) {
                 return false;
@@ -328,8 +324,6 @@ pub const ErrorInt = u32;
 pub const Export = struct {
     options: std.builtin.ExportOptions,
     src: LazySrcLoc,
-    /// Represents the position of the export, if any, in the output file.
-    link: link.File.Export,
     /// The Decl that performs the export. Note that this is *not* the Decl being exported.
     owner_decl: Decl.Index,
     /// The Decl containing the export statement.  Inline function calls
@@ -528,21 +522,10 @@ pub const Decl = struct {
     /// Decl is marked alive, then it sends the Decl to the linker. Otherwise it
     /// deletes the Decl on the spot.
     alive: bool,
-    /// Whether the Decl is a `usingnamespace` declaration.
-    is_usingnamespace: bool,
     /// If true `name` is already fully qualified.
     name_fully_qualified: bool = false,
-
-    /// Represents the position of the code in the output file.
-    /// This is populated regardless of semantic analysis and code generation.
-    link: link.File.LinkBlock,
-
-    /// Represents the function in the linked output file, if the `Decl` is a function.
-    /// This is stored here and not in `Fn` because `Decl` survives across updates but
-    /// `Fn` does not.
-    /// TODO Look into making `Fn` a longer lived structure and moving this field there
-    /// to save on memory usage.
-    fn_link: link.File.LinkFn,
+    /// What kind of a declaration is this.
+    kind: Kind,
 
     /// The shallow set of other decls whose typed_value could possibly change if this Decl's
     /// typed_value is modified.
@@ -550,6 +533,14 @@ pub const Decl = struct {
     /// The shallow set of other decls whose typed_value changing indicates that this Decl's
     /// typed_value may need to be regenerated.
     dependencies: DepsTable = .{},
+
+    pub const Kind = enum {
+        @"usingnamespace",
+        @"test",
+        @"comptime",
+        named,
+        anon,
+    };
 
     pub const Index = enum(u32) {
         _,
@@ -933,7 +924,8 @@ pub const Struct = struct {
     owner_decl: Decl.Index,
     /// Index of the struct_decl ZIR instruction.
     zir_index: Zir.Inst.Index,
-
+    /// Indexes into `fields` sorted to be most memory efficient.
+    optimized_order: ?[*]u32 = null,
     layout: std.builtin.Type.ContainerLayout,
     /// If the layout is not packed, this is the noreturn type.
     /// If the layout is packed, this is the backing integer type of the packed struct.
@@ -1015,6 +1007,10 @@ pub const Struct = struct {
         }
     };
 
+    /// Used in `optimized_order` to indicate field that is not present in the
+    /// runtime version of the struct.
+    pub const omitted_field = std.math.maxInt(u32);
+
     pub fn getFullyQualifiedName(s: *Struct, mod: *Module) ![:0]u8 {
         return mod.declPtr(s.owner_decl).getFullyQualifiedName(mod);
     }
@@ -1040,34 +1036,13 @@ pub const Struct = struct {
             return s.srcLoc(mod);
         };
         const node = owner_decl.relativeToNodeIndex(0);
-        const node_tags = tree.nodes.items(.tag);
-        switch (node_tags[node]) {
-            .container_decl,
-            .container_decl_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.containerDecl(node)),
-            .container_decl_two, .container_decl_two_trailing => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                return queryFieldSrc(tree.*, query, file, tree.containerDeclTwo(&buffer, node));
-            },
-            .container_decl_arg,
-            .container_decl_arg_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.containerDeclArg(node)),
 
-            .tagged_union,
-            .tagged_union_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.taggedUnion(node)),
-            .tagged_union_two, .tagged_union_two_trailing => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                return queryFieldSrc(tree.*, query, file, tree.taggedUnionTwo(&buffer, node));
-            },
-            .tagged_union_enum_tag,
-            .tagged_union_enum_tag_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.taggedUnionEnumTag(node)),
-
-            .root => return queryFieldSrc(tree.*, query, file, tree.containerDeclRoot()),
-
+        var buf: [2]Ast.Node.Index = undefined;
+        if (tree.fullContainerDecl(&buf, node)) |container_decl| {
+            return queryFieldSrc(tree.*, query, file, container_decl);
+        } else {
             // This struct was generated using @Type
-            else => return s.srcLoc(mod),
+            return s.srcLoc(mod);
         }
     }
 
@@ -1103,13 +1078,46 @@ pub const Struct = struct {
         assert(s.layout == .Packed);
         assert(s.haveLayout());
         var bit_sum: u64 = 0;
-        for (s.fields.values()) |field, i| {
+        for (s.fields.values(), 0..) |field, i| {
             if (i == index) {
                 return @intCast(u16, bit_sum);
             }
             bit_sum += field.ty.bitSize(target);
         }
         unreachable; // index out of bounds
+    }
+
+    pub const RuntimeFieldIterator = struct {
+        struct_obj: *const Struct,
+        index: u32 = 0,
+
+        pub const FieldAndIndex = struct {
+            field: Field,
+            index: u32,
+        };
+
+        pub fn next(it: *RuntimeFieldIterator) ?FieldAndIndex {
+            while (true) {
+                var i = it.index;
+                it.index += 1;
+                if (it.struct_obj.fields.count() <= i)
+                    return null;
+
+                if (it.struct_obj.optimized_order) |some| {
+                    i = some[i];
+                    if (i == Module.Struct.omitted_field) return null;
+                }
+                const field = it.struct_obj.fields.values()[i];
+
+                if (!field.is_comptime and field.ty.hasRuntimeBits()) {
+                    return FieldAndIndex{ .index = i, .field = field };
+                }
+            }
+        }
+    };
+
+    pub fn runtimeFieldIterator(s: *const Struct) RuntimeFieldIterator {
+        return .{ .struct_obj = s };
     }
 };
 
@@ -1194,6 +1202,27 @@ pub const EnumFull = struct {
             .lazy = LazySrcLoc.nodeOffset(0),
         };
     }
+
+    pub fn fieldSrcLoc(e: EnumFull, mod: *Module, query: FieldSrcQuery) SrcLoc {
+        @setCold(true);
+        const owner_decl = mod.declPtr(e.owner_decl);
+        const file = owner_decl.getFileScope();
+        const tree = file.getTree(mod.gpa) catch |err| {
+            // In this case we emit a warning + a less precise source location.
+            log.warn("unable to load {s}: {s}", .{
+                file.sub_file_path, @errorName(err),
+            });
+            return e.srcLoc(mod);
+        };
+        const node = owner_decl.relativeToNodeIndex(0);
+        var buf: [2]Ast.Node.Index = undefined;
+        if (tree.fullContainerDecl(&buf, node)) |container_decl| {
+            return queryFieldSrc(tree.*, query, file, container_decl);
+        } else {
+            // This enum was generated using @Type
+            return e.srcLoc(mod);
+        }
+    }
 };
 
 pub const Union = struct {
@@ -1272,30 +1301,13 @@ pub const Union = struct {
             return u.srcLoc(mod);
         };
         const node = owner_decl.relativeToNodeIndex(0);
-        const node_tags = tree.nodes.items(.tag);
+
         var buf: [2]Ast.Node.Index = undefined;
-        switch (node_tags[node]) {
-            .container_decl,
-            .container_decl_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.containerDecl(node)),
-            .container_decl_two, .container_decl_two_trailing => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                return queryFieldSrc(tree.*, query, file, tree.containerDeclTwo(&buffer, node));
-            },
-            .container_decl_arg,
-            .container_decl_arg_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.containerDeclArg(node)),
-            .tagged_union,
-            .tagged_union_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.taggedUnion(node)),
-            .tagged_union_two,
-            .tagged_union_two_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.taggedUnionTwo(&buf, node)),
-            .tagged_union_enum_tag,
-            .tagged_union_enum_tag_trailing,
-            => return queryFieldSrc(tree.*, query, file, tree.taggedUnionEnumTag(node)),
+        if (tree.fullContainerDecl(&buf, node)) |container_decl| {
+            return queryFieldSrc(tree.*, query, file, container_decl);
+        } else {
             // This union was generated using @Type
-            else => return u.srcLoc(mod),
+            return u.srcLoc(mod);
         }
     }
 
@@ -1325,7 +1337,7 @@ pub const Union = struct {
         assert(u.haveFieldTypes());
         var most_alignment: u32 = 0;
         var most_index: usize = undefined;
-        for (u.fields.values()) |field, i| {
+        for (u.fields.values(), 0..) |field, i| {
             if (!field.ty.hasRuntimeBits()) continue;
 
             const field_align = field.normalAlignment(target);
@@ -1389,7 +1401,7 @@ pub const Union = struct {
         var payload_size: u64 = 0;
         var payload_align: u32 = 0;
         const fields = u.fields.values();
-        for (fields) |field, i| {
+        for (fields, 0..) |field, i| {
             if (!field.ty.hasRuntimeBitsIgnoreComptime()) continue;
 
             const field_align = a: {
@@ -1914,6 +1926,10 @@ pub const File = struct {
     zir: Zir,
     /// Package that this file is a part of, managed externally.
     pkg: *Package,
+    /// Whether this file is a part of multiple packages. This is an error condition which will be reported after AstGen.
+    multi_pkg: bool = false,
+    /// List of references to this file, used for multi-package errors.
+    references: std.ArrayListUnmanaged(Reference) = .{},
 
     /// Used by change detection algorithm, after astgen, contains the
     /// set of decls that existed in the previous ZIR but not in the new one.
@@ -1928,6 +1944,14 @@ pub const File = struct {
     /// newly introduces compile errors during an update. When ZIR is
     /// successful, this field is unloaded.
     prev_zir: ?*Zir = null,
+
+    /// A single reference to a file.
+    pub const Reference = union(enum) {
+        /// The file is imported directly (i.e. not as a package) with @import.
+        import: SrcLoc,
+        /// The file is the root of a package.
+        root: *Package,
+    };
 
     pub fn unload(file: *File, gpa: Allocator) void {
         file.unloadTree(gpa);
@@ -1961,6 +1985,7 @@ pub const File = struct {
         log.debug("deinit File {s}", .{file.sub_file_path});
         file.deleted_decls.deinit(gpa);
         file.outdated_decls.deinit(gpa);
+        file.references.deinit(gpa);
         if (file.root_decl.unwrap()) |root_decl| {
             mod.destroyDecl(root_decl);
         }
@@ -2025,7 +2050,7 @@ pub const File = struct {
         if (file.tree_loaded) return &file.tree;
 
         const source = try file.getSource(gpa);
-        file.tree = try std.zig.parse(gpa, source.bytes);
+        file.tree = try Ast.parse(gpa, source.bytes, .zig);
         file.tree_loaded = true;
         return &file.tree;
     }
@@ -2080,6 +2105,67 @@ pub const File = struct {
             .parse_failure, .astgen_failure => false,
             else => true,
         };
+    }
+
+    /// Add a reference to this file during AstGen.
+    pub fn addReference(file: *File, mod: Module, ref: Reference) !void {
+        // Don't add the same module root twice. Note that since we always add module roots at the
+        // front of the references array (see below), this loop is actually O(1) on valid code.
+        if (ref == .root) {
+            for (file.references.items) |other| {
+                switch (other) {
+                    .root => |r| if (ref.root == r) return,
+                    else => break, // reached the end of the "is-root" references
+                }
+            }
+        }
+
+        switch (ref) {
+            // We put root references at the front of the list both to make the above loop fast and
+            // to make multi-module errors more helpful (since "root-of" notes are generally more
+            // informative than "imported-from" notes). This path is hit very rarely, so the speed
+            // of the insert operation doesn't matter too much.
+            .root => try file.references.insert(mod.gpa, 0, ref),
+
+            // Other references we'll just put at the end.
+            else => try file.references.append(mod.gpa, ref),
+        }
+
+        const pkg = switch (ref) {
+            .import => |loc| loc.file_scope.pkg,
+            .root => |pkg| pkg,
+        };
+        if (pkg != file.pkg) file.multi_pkg = true;
+    }
+
+    /// Mark this file and every file referenced by it as multi_pkg and report an
+    /// astgen_failure error for them. AstGen must have completed in its entirety.
+    pub fn recursiveMarkMultiPkg(file: *File, mod: *Module) void {
+        file.multi_pkg = true;
+        file.status = .astgen_failure;
+
+        // We can only mark children as failed if the ZIR is loaded, which may not
+        // be the case if there were other astgen failures in this file
+        if (!file.zir_loaded) return;
+
+        const imports_index = file.zir.extra[@enumToInt(Zir.ExtraIndex.imports)];
+        if (imports_index == 0) return;
+        const extra = file.zir.extraData(Zir.Inst.Imports, imports_index);
+
+        var import_i: u32 = 0;
+        var extra_index = extra.end;
+        while (import_i < extra.data.imports_len) : (import_i += 1) {
+            const item = file.zir.extraData(Zir.Inst.Imports.Item, extra_index);
+            extra_index = item.end;
+
+            const import_path = file.zir.nullTerminatedString(item.data.name);
+            if (mem.eql(u8, import_path, "builtin")) continue;
+
+            const res = mod.importFile(file, import_path) catch continue;
+            if (!res.is_pkg and !res.file.multi_pkg) {
+                res.file.recursiveMarkMultiPkg(mod);
+            }
+        }
     }
 };
 
@@ -2261,10 +2347,11 @@ pub const SrcLoc = struct {
                 const node = src_loc.declRelativeToNodeIndex(node_off);
                 const node_tags = tree.nodes.items(.tag);
                 const full = switch (node_tags[node]) {
-                    .global_var_decl => tree.globalVarDecl(node),
-                    .local_var_decl => tree.localVarDecl(node),
-                    .simple_var_decl => tree.simpleVarDecl(node),
-                    .aligned_var_decl => tree.alignedVarDecl(node),
+                    .global_var_decl,
+                    .local_var_decl,
+                    .simple_var_decl,
+                    .aligned_var_decl,
+                    => tree.fullVarDecl(node).?,
                     .@"usingnamespace" => {
                         const node_data = tree.nodes.items(.data);
                         return nodeToSpan(tree, node_data[node].lhs);
@@ -2282,53 +2369,25 @@ pub const SrcLoc = struct {
             .node_offset_var_decl_align => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                const node_tags = tree.nodes.items(.tag);
-                const full: Ast.full.VarDecl = switch (node_tags[node]) {
-                    .global_var_decl => tree.globalVarDecl(node),
-                    .local_var_decl => tree.localVarDecl(node),
-                    .simple_var_decl => tree.simpleVarDecl(node),
-                    .aligned_var_decl => tree.alignedVarDecl(node),
-                    else => unreachable,
-                };
+                const full = tree.fullVarDecl(node).?;
                 return nodeToSpan(tree, full.ast.align_node);
             },
             .node_offset_var_decl_section => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                const node_tags = tree.nodes.items(.tag);
-                const full: Ast.full.VarDecl = switch (node_tags[node]) {
-                    .global_var_decl => tree.globalVarDecl(node),
-                    .local_var_decl => tree.localVarDecl(node),
-                    .simple_var_decl => tree.simpleVarDecl(node),
-                    .aligned_var_decl => tree.alignedVarDecl(node),
-                    else => unreachable,
-                };
+                const full = tree.fullVarDecl(node).?;
                 return nodeToSpan(tree, full.ast.section_node);
             },
             .node_offset_var_decl_addrspace => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                const node_tags = tree.nodes.items(.tag);
-                const full: Ast.full.VarDecl = switch (node_tags[node]) {
-                    .global_var_decl => tree.globalVarDecl(node),
-                    .local_var_decl => tree.localVarDecl(node),
-                    .simple_var_decl => tree.simpleVarDecl(node),
-                    .aligned_var_decl => tree.alignedVarDecl(node),
-                    else => unreachable,
-                };
+                const full = tree.fullVarDecl(node).?;
                 return nodeToSpan(tree, full.ast.addrspace_node);
             },
             .node_offset_var_decl_init => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                const node_tags = tree.nodes.items(.tag);
-                const full: Ast.full.VarDecl = switch (node_tags[node]) {
-                    .global_var_decl => tree.globalVarDecl(node),
-                    .local_var_decl => tree.localVarDecl(node),
-                    .simple_var_decl => tree.simpleVarDecl(node),
-                    .aligned_var_decl => tree.alignedVarDecl(node),
-                    else => unreachable,
-                };
+                const full = tree.fullVarDecl(node).?;
                 return nodeToSpan(tree, full.ast.init_node);
             },
             .node_offset_builtin_call_arg0 => |n| return src_loc.byteOffsetBuiltinCallArg(gpa, n, 0),
@@ -2349,14 +2408,8 @@ pub const SrcLoc = struct {
             .node_offset_slice_sentinel,
             => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                const full = switch (node_tags[node]) {
-                    .slice_open => tree.sliceOpen(node),
-                    .slice => tree.slice(node),
-                    .slice_sentinel => tree.sliceSentinel(node),
-                    else => unreachable,
-                };
+                const full = tree.fullSlice(node).?;
                 const part_node = switch (src_loc.lazy) {
                     .node_offset_slice_ptr => full.ast.sliced,
                     .node_offset_slice_start => full.ast.start,
@@ -2368,24 +2421,9 @@ pub const SrcLoc = struct {
             },
             .node_offset_call_func => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                var params: [1]Ast.Node.Index = undefined;
-                const full = switch (node_tags[node]) {
-                    .call_one,
-                    .call_one_comma,
-                    .async_call_one,
-                    .async_call_one_comma,
-                    => tree.callOne(&params, node),
-
-                    .call,
-                    .call_comma,
-                    .async_call,
-                    .async_call_comma,
-                    => tree.callFull(node),
-
-                    else => unreachable,
-                };
+                var buf: [1]Ast.Node.Index = undefined;
+                const full = tree.fullCall(&buf, node).?;
                 return nodeToSpan(tree, full.ast.fn_expr);
             },
             .node_offset_field_name => |node_off| {
@@ -2408,46 +2446,96 @@ pub const SrcLoc = struct {
             },
             .node_offset_asm_source => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                const full = switch (node_tags[node]) {
-                    .asm_simple => tree.asmSimple(node),
-                    .@"asm" => tree.asmFull(node),
-                    else => unreachable,
-                };
+                const full = tree.fullAsm(node).?;
                 return nodeToSpan(tree, full.ast.template);
             },
             .node_offset_asm_ret_ty => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                const full = switch (node_tags[node]) {
-                    .asm_simple => tree.asmSimple(node),
-                    .@"asm" => tree.asmFull(node),
-                    else => unreachable,
-                };
+                const full = tree.fullAsm(node).?;
                 const asm_output = full.outputs[0];
                 const node_datas = tree.nodes.items(.data);
                 return nodeToSpan(tree, node_datas[asm_output].lhs);
             },
 
-            .node_offset_for_cond, .node_offset_if_cond => |node_off| {
+            .node_offset_if_cond => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
                 const node_tags = tree.nodes.items(.tag);
                 const src_node = switch (node_tags[node]) {
-                    .if_simple => tree.ifSimple(node).ast.cond_expr,
-                    .@"if" => tree.ifFull(node).ast.cond_expr,
-                    .while_simple => tree.whileSimple(node).ast.cond_expr,
-                    .while_cont => tree.whileCont(node).ast.cond_expr,
-                    .@"while" => tree.whileFull(node).ast.cond_expr,
-                    .for_simple => tree.forSimple(node).ast.cond_expr,
-                    .@"for" => tree.forFull(node).ast.cond_expr,
+                    .if_simple,
+                    .@"if",
+                    => tree.fullIf(node).?.ast.cond_expr,
+
+                    .while_simple,
+                    .while_cont,
+                    .@"while",
+                    => tree.fullWhile(node).?.ast.cond_expr,
+
+                    .for_simple,
+                    .@"for",
+                    => {
+                        const inputs = tree.fullFor(node).?.ast.inputs;
+                        const start = tree.firstToken(inputs[0]);
+                        const end = tree.lastToken(inputs[inputs.len - 1]);
+                        return tokensToSpan(tree, start, end, start);
+                    },
+
                     .@"orelse" => node,
                     .@"catch" => node,
                     else => unreachable,
                 };
                 return nodeToSpan(tree, src_node);
+            },
+            .for_input => |for_input| {
+                const tree = try src_loc.file_scope.getTree(gpa);
+                const node = src_loc.declRelativeToNodeIndex(for_input.for_node_offset);
+                const for_full = tree.fullFor(node).?;
+                const src_node = for_full.ast.inputs[for_input.input_index];
+                return nodeToSpan(tree, src_node);
+            },
+            .for_capture_from_input => |node_off| {
+                const tree = try src_loc.file_scope.getTree(gpa);
+                const token_tags = tree.tokens.items(.tag);
+                const input_node = src_loc.declRelativeToNodeIndex(node_off);
+                // We have to actually linear scan the whole AST to find the for loop
+                // that contains this input.
+                const node_tags = tree.nodes.items(.tag);
+                for (node_tags, 0..) |node_tag, node_usize| {
+                    const node = @intCast(Ast.Node.Index, node_usize);
+                    switch (node_tag) {
+                        .for_simple, .@"for" => {
+                            const for_full = tree.fullFor(node).?;
+                            for (for_full.ast.inputs, 0..) |input, input_index| {
+                                if (input_node == input) {
+                                    var count = input_index;
+                                    var tok = for_full.payload_token;
+                                    while (true) {
+                                        switch (token_tags[tok]) {
+                                            .comma => {
+                                                count -= 1;
+                                                tok += 1;
+                                            },
+                                            .identifier => {
+                                                if (count == 0)
+                                                    return tokensToSpan(tree, tok, tok + 1, tok);
+                                                tok += 1;
+                                            },
+                                            .asterisk => {
+                                                if (count == 0)
+                                                    return tokensToSpan(tree, tok, tok + 2, tok);
+                                                tok += 1;
+                                            },
+                                            else => unreachable,
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        else => continue,
+                    }
+                } else unreachable;
             },
             .node_offset_bin_lhs => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
@@ -2478,11 +2566,7 @@ pub const SrcLoc = struct {
                 const extra = tree.extraData(node_datas[switch_node].rhs, Ast.Node.SubRange);
                 const case_nodes = tree.extra_data[extra.start..extra.end];
                 for (case_nodes) |case_node| {
-                    const case = switch (node_tags[case_node]) {
-                        .switch_case_one, .switch_case_inline_one => tree.switchCaseOne(case_node),
-                        .switch_case, .switch_case_inline => tree.switchCase(case_node),
-                        else => unreachable,
-                    };
+                    const case = tree.fullSwitchCase(case_node).?;
                     const is_special = (case.ast.values.len == 0) or
                         (case.ast.values.len == 1 and
                         node_tags[case.ast.values[0]] == .identifier and
@@ -2502,11 +2586,7 @@ pub const SrcLoc = struct {
                 const extra = tree.extraData(node_datas[switch_node].rhs, Ast.Node.SubRange);
                 const case_nodes = tree.extra_data[extra.start..extra.end];
                 for (case_nodes) |case_node| {
-                    const case = switch (node_tags[case_node]) {
-                        .switch_case_one, .switch_case_inline_one => tree.switchCaseOne(case_node),
-                        .switch_case, .switch_case_inline => tree.switchCase(case_node),
-                        else => unreachable,
-                    };
+                    const case = tree.fullSwitchCase(case_node).?;
                     const is_special = (case.ast.values.len == 0) or
                         (case.ast.values.len == 1 and
                         node_tags[case.ast.values[0]] == .identifier and
@@ -2523,12 +2603,7 @@ pub const SrcLoc = struct {
             .node_offset_switch_prong_capture => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
                 const case_node = src_loc.declRelativeToNodeIndex(node_off);
-                const node_tags = tree.nodes.items(.tag);
-                const case = switch (node_tags[case_node]) {
-                    .switch_case_one, .switch_case_inline_one => tree.switchCaseOne(case_node),
-                    .switch_case, .switch_case_inline => tree.switchCase(case_node),
-                    else => unreachable,
-                };
+                const case = tree.fullSwitchCase(case_node).?;
                 const start_tok = case.payload_token.?;
                 const token_tags = tree.tokens.items(.tag);
                 const end_tok = switch (token_tags[start_tok]) {
@@ -2542,116 +2617,38 @@ pub const SrcLoc = struct {
             },
             .node_offset_fn_type_align => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_datas = tree.nodes.items(.data);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                var params: [1]Ast.Node.Index = undefined;
-                const full = switch (node_tags[node]) {
-                    .fn_proto_simple => tree.fnProtoSimple(&params, node),
-                    .fn_proto_multi => tree.fnProtoMulti(node),
-                    .fn_proto_one => tree.fnProtoOne(&params, node),
-                    .fn_proto => tree.fnProto(node),
-                    .fn_decl => switch (node_tags[node_datas[node].lhs]) {
-                        .fn_proto_simple => tree.fnProtoSimple(&params, node_datas[node].lhs),
-                        .fn_proto_multi => tree.fnProtoMulti(node_datas[node].lhs),
-                        .fn_proto_one => tree.fnProtoOne(&params, node_datas[node].lhs),
-                        .fn_proto => tree.fnProto(node_datas[node].lhs),
-                        else => unreachable,
-                    },
-                    else => unreachable,
-                };
+                var buf: [1]Ast.Node.Index = undefined;
+                const full = tree.fullFnProto(&buf, node).?;
                 return nodeToSpan(tree, full.ast.align_expr);
             },
             .node_offset_fn_type_addrspace => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_datas = tree.nodes.items(.data);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                var params: [1]Ast.Node.Index = undefined;
-                const full = switch (node_tags[node]) {
-                    .fn_proto_simple => tree.fnProtoSimple(&params, node),
-                    .fn_proto_multi => tree.fnProtoMulti(node),
-                    .fn_proto_one => tree.fnProtoOne(&params, node),
-                    .fn_proto => tree.fnProto(node),
-                    .fn_decl => switch (node_tags[node_datas[node].lhs]) {
-                        .fn_proto_simple => tree.fnProtoSimple(&params, node_datas[node].lhs),
-                        .fn_proto_multi => tree.fnProtoMulti(node_datas[node].lhs),
-                        .fn_proto_one => tree.fnProtoOne(&params, node_datas[node].lhs),
-                        .fn_proto => tree.fnProto(node_datas[node].lhs),
-                        else => unreachable,
-                    },
-                    else => unreachable,
-                };
+                var buf: [1]Ast.Node.Index = undefined;
+                const full = tree.fullFnProto(&buf, node).?;
                 return nodeToSpan(tree, full.ast.addrspace_expr);
             },
             .node_offset_fn_type_section => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_datas = tree.nodes.items(.data);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                var params: [1]Ast.Node.Index = undefined;
-                const full = switch (node_tags[node]) {
-                    .fn_proto_simple => tree.fnProtoSimple(&params, node),
-                    .fn_proto_multi => tree.fnProtoMulti(node),
-                    .fn_proto_one => tree.fnProtoOne(&params, node),
-                    .fn_proto => tree.fnProto(node),
-                    .fn_decl => switch (node_tags[node_datas[node].lhs]) {
-                        .fn_proto_simple => tree.fnProtoSimple(&params, node_datas[node].lhs),
-                        .fn_proto_multi => tree.fnProtoMulti(node_datas[node].lhs),
-                        .fn_proto_one => tree.fnProtoOne(&params, node_datas[node].lhs),
-                        .fn_proto => tree.fnProto(node_datas[node].lhs),
-                        else => unreachable,
-                    },
-                    else => unreachable,
-                };
+                var buf: [1]Ast.Node.Index = undefined;
+                const full = tree.fullFnProto(&buf, node).?;
                 return nodeToSpan(tree, full.ast.section_expr);
             },
             .node_offset_fn_type_cc => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_datas = tree.nodes.items(.data);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                var params: [1]Ast.Node.Index = undefined;
-                const full = switch (node_tags[node]) {
-                    .fn_proto_simple => tree.fnProtoSimple(&params, node),
-                    .fn_proto_multi => tree.fnProtoMulti(node),
-                    .fn_proto_one => tree.fnProtoOne(&params, node),
-                    .fn_proto => tree.fnProto(node),
-                    .fn_decl => switch (node_tags[node_datas[node].lhs]) {
-                        .fn_proto_simple => tree.fnProtoSimple(&params, node_datas[node].lhs),
-                        .fn_proto_multi => tree.fnProtoMulti(node_datas[node].lhs),
-                        .fn_proto_one => tree.fnProtoOne(&params, node_datas[node].lhs),
-                        .fn_proto => tree.fnProto(node_datas[node].lhs),
-                        else => unreachable,
-                    },
-                    else => unreachable,
-                };
+                var buf: [1]Ast.Node.Index = undefined;
+                const full = tree.fullFnProto(&buf, node).?;
                 return nodeToSpan(tree, full.ast.callconv_expr);
             },
 
             .node_offset_fn_type_ret_ty => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_datas = tree.nodes.items(.data);
-                const node_tags = tree.nodes.items(.tag);
                 const node = src_loc.declRelativeToNodeIndex(node_off);
-                var params: [1]Ast.Node.Index = undefined;
-                const full = switch (node_tags[node]) {
-                    .fn_proto_simple => tree.fnProtoSimple(&params, node),
-                    .fn_proto_multi => tree.fnProtoMulti(node),
-                    .fn_proto_one => tree.fnProtoOne(&params, node),
-                    .fn_proto => tree.fnProto(node),
-                    .fn_decl => blk: {
-                        const fn_proto = node_datas[node].lhs;
-                        break :blk switch (node_tags[fn_proto]) {
-                            .fn_proto_simple => tree.fnProtoSimple(&params, fn_proto),
-                            .fn_proto_multi => tree.fnProtoMulti(fn_proto),
-                            .fn_proto_one => tree.fnProtoOne(&params, fn_proto),
-                            .fn_proto => tree.fnProto(fn_proto),
-                            else => unreachable,
-                        };
-                    },
-                    else => unreachable,
-                };
+                var buf: [1]Ast.Node.Index = undefined;
+                const full = tree.fullFnProto(&buf, node).?;
                 return nodeToSpan(tree, full.ast.return_type);
             },
             .node_offset_param => |node_off| {
@@ -2699,27 +2696,9 @@ pub const SrcLoc = struct {
 
             .node_offset_lib_name => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_datas = tree.nodes.items(.data);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
-                var params: [1]Ast.Node.Index = undefined;
-                const full = switch (node_tags[parent_node]) {
-                    .fn_proto_simple => tree.fnProtoSimple(&params, parent_node),
-                    .fn_proto_multi => tree.fnProtoMulti(parent_node),
-                    .fn_proto_one => tree.fnProtoOne(&params, parent_node),
-                    .fn_proto => tree.fnProto(parent_node),
-                    .fn_decl => blk: {
-                        const fn_proto = node_datas[parent_node].lhs;
-                        break :blk switch (node_tags[fn_proto]) {
-                            .fn_proto_simple => tree.fnProtoSimple(&params, fn_proto),
-                            .fn_proto_multi => tree.fnProtoMulti(fn_proto),
-                            .fn_proto_one => tree.fnProtoOne(&params, fn_proto),
-                            .fn_proto => tree.fnProto(fn_proto),
-                            else => unreachable,
-                        };
-                    },
-                    else => unreachable,
-                };
+                var buf: [1]Ast.Node.Index = undefined;
+                const full = tree.fullFnProto(&buf, parent_node).?;
                 const tok_index = full.lib_name.?;
                 const start = tree.tokens.items(.start)[tok_index];
                 const end = start + @intCast(u32, tree.tokenSlice(tok_index).len);
@@ -2728,38 +2707,23 @@ pub const SrcLoc = struct {
 
             .node_offset_array_type_len => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.ArrayType = switch (node_tags[parent_node]) {
-                    .array_type => tree.arrayType(parent_node),
-                    .array_type_sentinel => tree.arrayTypeSentinel(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullArrayType(parent_node).?;
                 return nodeToSpan(tree, full.ast.elem_count);
             },
             .node_offset_array_type_sentinel => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.ArrayType = switch (node_tags[parent_node]) {
-                    .array_type => tree.arrayType(parent_node),
-                    .array_type_sentinel => tree.arrayTypeSentinel(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullArrayType(parent_node).?;
                 return nodeToSpan(tree, full.ast.sentinel);
             },
             .node_offset_array_type_elem => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.ArrayType = switch (node_tags[parent_node]) {
-                    .array_type => tree.arrayType(parent_node),
-                    .array_type_sentinel => tree.arrayTypeSentinel(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullArrayType(parent_node).?;
                 return nodeToSpan(tree, full.ast.elem_type);
             },
             .node_offset_un_op => |node_off| {
@@ -2771,86 +2735,44 @@ pub const SrcLoc = struct {
             },
             .node_offset_ptr_elem => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.PtrType = switch (node_tags[parent_node]) {
-                    .ptr_type_aligned => tree.ptrTypeAligned(parent_node),
-                    .ptr_type_sentinel => tree.ptrTypeSentinel(parent_node),
-                    .ptr_type => tree.ptrType(parent_node),
-                    .ptr_type_bit_range => tree.ptrTypeBitRange(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullPtrType(parent_node).?;
                 return nodeToSpan(tree, full.ast.child_type);
             },
             .node_offset_ptr_sentinel => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.PtrType = switch (node_tags[parent_node]) {
-                    .ptr_type_aligned => tree.ptrTypeAligned(parent_node),
-                    .ptr_type_sentinel => tree.ptrTypeSentinel(parent_node),
-                    .ptr_type => tree.ptrType(parent_node),
-                    .ptr_type_bit_range => tree.ptrTypeBitRange(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullPtrType(parent_node).?;
                 return nodeToSpan(tree, full.ast.sentinel);
             },
             .node_offset_ptr_align => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.PtrType = switch (node_tags[parent_node]) {
-                    .ptr_type_aligned => tree.ptrTypeAligned(parent_node),
-                    .ptr_type_sentinel => tree.ptrTypeSentinel(parent_node),
-                    .ptr_type => tree.ptrType(parent_node),
-                    .ptr_type_bit_range => tree.ptrTypeBitRange(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullPtrType(parent_node).?;
                 return nodeToSpan(tree, full.ast.align_node);
             },
             .node_offset_ptr_addrspace => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.PtrType = switch (node_tags[parent_node]) {
-                    .ptr_type_aligned => tree.ptrTypeAligned(parent_node),
-                    .ptr_type_sentinel => tree.ptrTypeSentinel(parent_node),
-                    .ptr_type => tree.ptrType(parent_node),
-                    .ptr_type_bit_range => tree.ptrTypeBitRange(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullPtrType(parent_node).?;
                 return nodeToSpan(tree, full.ast.addrspace_node);
             },
             .node_offset_ptr_bitoffset => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.PtrType = switch (node_tags[parent_node]) {
-                    .ptr_type_aligned => tree.ptrTypeAligned(parent_node),
-                    .ptr_type_sentinel => tree.ptrTypeSentinel(parent_node),
-                    .ptr_type => tree.ptrType(parent_node),
-                    .ptr_type_bit_range => tree.ptrTypeBitRange(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullPtrType(parent_node).?;
                 return nodeToSpan(tree, full.ast.bit_range_start);
             },
             .node_offset_ptr_hostsize => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
-                const full: Ast.full.PtrType = switch (node_tags[parent_node]) {
-                    .ptr_type_aligned => tree.ptrTypeAligned(parent_node),
-                    .ptr_type_sentinel => tree.ptrTypeSentinel(parent_node),
-                    .ptr_type => tree.ptrType(parent_node),
-                    .ptr_type_bit_range => tree.ptrTypeBitRange(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullPtrType(parent_node).?;
                 return nodeToSpan(tree, full.ast.bit_range_end);
             },
             .node_offset_container_tag => |node_off| {
@@ -2890,17 +2812,10 @@ pub const SrcLoc = struct {
             },
             .node_offset_init_ty => |node_off| {
                 const tree = try src_loc.file_scope.getTree(gpa);
-                const node_tags = tree.nodes.items(.tag);
                 const parent_node = src_loc.declRelativeToNodeIndex(node_off);
 
                 var buf: [2]Ast.Node.Index = undefined;
-                const full: Ast.full.ArrayInit = switch (node_tags[parent_node]) {
-                    .array_init_one, .array_init_one_comma => tree.arrayInitOne(buf[0..1], parent_node),
-                    .array_init_dot_two, .array_init_dot_two_comma => tree.arrayInitDotTwo(&buf, parent_node),
-                    .array_init_dot, .array_init_dot_comma => tree.arrayInitDot(parent_node),
-                    .array_init, .array_init_comma => tree.arrayInit(parent_node),
-                    else => unreachable,
-                };
+                const full = tree.fullArrayInit(&buf, parent_node).?;
                 return nodeToSpan(tree, full.ast.type_expr);
             },
             .node_offset_store_ptr => |node_off| {
@@ -3059,12 +2974,6 @@ pub const LazySrcLoc = union(enum) {
     /// The source location points to the initializer of a var decl.
     /// The Decl is determined contextually.
     node_offset_var_decl_init: i32,
-    /// The source location points to a for loop condition expression,
-    /// found by taking this AST node index offset from the containing
-    /// Decl AST node, which points to a for loop AST node. Next, navigate
-    /// to the condition expression.
-    /// The Decl is determined contextually.
-    node_offset_for_cond: i32,
     /// The source location points to the first parameter of a builtin
     /// function call, found by taking this AST node index offset from the containing
     /// Decl AST node, which points to a builtin call AST node. Next, navigate
@@ -3274,6 +3183,20 @@ pub const LazySrcLoc = union(enum) {
     /// The source location points to the RHS of an assignment.
     /// The Decl is determined contextually.
     node_offset_store_operand: i32,
+    /// The source location points to a for loop input.
+    /// The Decl is determined contextually.
+    for_input: struct {
+        /// Points to the for loop AST node.
+        for_node_offset: i32,
+        /// Picks one of the inputs from the condition.
+        input_index: u32,
+    },
+    /// The source location points to one of the captures of a for loop, found
+    /// by taking this AST node index offset from the containing
+    /// Decl AST node, which points to one of the input nodes of a for loop.
+    /// Next, navigate to the corresponding capture.
+    /// The Decl is determined contextually.
+    for_capture_from_input: i32,
 
     pub const nodeOffset = if (TracedOffset.want_tracing) nodeOffsetDebug else nodeOffsetRelease;
 
@@ -3311,7 +3234,6 @@ pub const LazySrcLoc = union(enum) {
             .node_offset_var_decl_section,
             .node_offset_var_decl_addrspace,
             .node_offset_var_decl_init,
-            .node_offset_for_cond,
             .node_offset_builtin_call_arg0,
             .node_offset_builtin_call_arg1,
             .node_offset_builtin_call_arg2,
@@ -3360,6 +3282,8 @@ pub const LazySrcLoc = union(enum) {
             .node_offset_init_ty,
             .node_offset_store_ptr,
             .node_offset_store_operand,
+            .for_input,
+            .for_capture_from_input,
             => .{
                 .file_scope = decl.getFileScope(),
                 .parent_decl_node = decl.src_node,
@@ -3423,7 +3347,11 @@ pub fn deinit(mod: *Module) void {
     }
     if (mod.main_pkg.table.fetchRemove("std")) |kv| {
         gpa.free(kv.key);
-        kv.value.destroy(gpa);
+        // It's possible for main_pkg to be std when running 'zig test'! In this case, we must not
+        // destroy it, since it would lead to a double-free.
+        if (kv.value != mod.main_pkg) {
+            kv.value.destroy(gpa);
+        }
     }
     if (mod.main_pkg.table.fetchRemove("root")) |kv| {
         gpa.free(kv.key);
@@ -3519,14 +3447,6 @@ pub fn deinit(mod: *Module) void {
 pub fn destroyDecl(mod: *Module, decl_index: Decl.Index) void {
     const gpa = mod.gpa;
     {
-        if (mod.failed_decls.contains(decl_index)) {
-            blk: {
-                const errs = mod.comp.getAllErrorsAlloc() catch break :blk;
-                for (errs.list) |err| Compilation.AllErrors.Message.renderToStdErr(err, .no_color);
-            }
-            // TODO restore test case triggering this panic
-            @panic("Zig compiler bug: attempted to destroy declaration with an attached error");
-        }
         const decl = mod.declPtr(decl_index);
         log.debug("destroy {*} ({s})", .{ decl, decl.name });
         _ = mod.test_functions.swapRemove(decl_index);
@@ -3540,8 +3460,8 @@ pub fn destroyDecl(mod: *Module, decl_index: Decl.Index) void {
             if (decl.getInnerNamespace()) |namespace| {
                 namespace.destroyDecls(mod);
             }
-            decl.clearValues(mod);
         }
+        decl.clearValues(mod);
         decl.dependants.deinit(gpa);
         decl.dependencies.deinit(gpa);
         decl.clearName(gpa);
@@ -3608,6 +3528,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
     const digest = hash: {
         var path_hash: Cache.HashHelper = .{};
         path_hash.addBytes(build_options.version);
+        path_hash.add(builtin.zig_backend);
         if (!want_local_cache) {
             path_hash.addOptionalBytes(file.pkg.root_src_directory.path);
         }
@@ -3617,44 +3538,66 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
     const cache_directory = if (want_local_cache) mod.local_zir_cache else mod.global_zir_cache;
     const zir_dir = cache_directory.handle;
 
-    var cache_file: ?std.fs.File = null;
-    defer if (cache_file) |f| f.close();
-
     // Determine whether we need to reload the file from disk and redo parsing and AstGen.
-    switch (file.status) {
-        .never_loaded, .retryable_failure => cached: {
+    var lock: std.fs.File.Lock = switch (file.status) {
+        .never_loaded, .retryable_failure => lock: {
             // First, load the cached ZIR code, if any.
             log.debug("AstGen checking cache: {s} (local={}, digest={s})", .{
                 file.sub_file_path, want_local_cache, &digest,
             });
 
-            // We ask for a lock in order to coordinate with other zig processes.
-            // If another process is already working on this file, we will get the cached
-            // version. Likewise if we're working on AstGen and another process asks for
-            // the cached file, they'll get it.
-            cache_file = zir_dir.openFile(&digest, .{ .lock = .Shared }) catch |err| switch (err) {
-                error.PathAlreadyExists => unreachable, // opening for reading
-                error.NoSpaceLeft => unreachable, // opening for reading
-                error.NotDir => unreachable, // no dir components
-                error.InvalidUtf8 => unreachable, // it's a hex encoded name
-                error.BadPathName => unreachable, // it's a hex encoded name
-                error.NameTooLong => unreachable, // it's a fixed size name
-                error.PipeBusy => unreachable, // it's not a pipe
-                error.WouldBlock => unreachable, // not asking for non-blocking I/O
+            break :lock .Shared;
+        },
+        .parse_failure, .astgen_failure, .success_zir => lock: {
+            const unchanged_metadata =
+                stat.size == file.stat.size and
+                stat.mtime == file.stat.mtime and
+                stat.inode == file.stat.inode;
 
-                error.SymLinkLoop,
-                error.FileNotFound,
-                error.Unexpected,
-                => break :cached,
+            if (unchanged_metadata) {
+                log.debug("unmodified metadata of file: {s}", .{file.sub_file_path});
+                return;
+            }
 
-                else => |e| return e, // Retryable errors are handled at callsite.
-            };
+            log.debug("metadata changed: {s}", .{file.sub_file_path});
 
+            break :lock .Exclusive;
+        },
+    };
+
+    // We ask for a lock in order to coordinate with other zig processes.
+    // If another process is already working on this file, we will get the cached
+    // version. Likewise if we're working on AstGen and another process asks for
+    // the cached file, they'll get it.
+    const cache_file = while (true) {
+        break zir_dir.createFile(&digest, .{
+            .read = true,
+            .truncate = false,
+            .lock = lock,
+        }) catch |err| switch (err) {
+            error.NotDir => unreachable, // no dir components
+            error.InvalidUtf8 => unreachable, // it's a hex encoded name
+            error.BadPathName => unreachable, // it's a hex encoded name
+            error.NameTooLong => unreachable, // it's a fixed size name
+            error.PipeBusy => unreachable, // it's not a pipe
+            error.WouldBlock => unreachable, // not asking for non-blocking I/O
+            // There are no dir components, so you would think that this was
+            // unreachable, however we have observed on macOS two processes racing
+            // to do openat() with O_CREAT manifest in ENOENT.
+            error.FileNotFound => continue,
+
+            else => |e| return e, // Retryable errors are handled at callsite.
+        };
+    };
+    defer cache_file.close();
+
+    while (true) {
+        update: {
             // First we read the header to determine the lengths of arrays.
-            const header = cache_file.?.reader().readStruct(Zir.Header) catch |err| switch (err) {
+            const header = cache_file.reader().readStruct(Zir.Header) catch |err| switch (err) {
                 // This can happen if Zig bails out of this function between creating
                 // the cached file and writing it.
-                error.EndOfStream => break :cached,
+                error.EndOfStream => break :update,
                 else => |e| return e,
             };
             const unchanged_metadata =
@@ -3664,7 +3607,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
 
             if (!unchanged_metadata) {
                 log.debug("AstGen cache stale: {s}", .{file.sub_file_path});
-                break :cached;
+                break :update;
             }
             log.debug("AstGen cache hit: {s} instructions_len={d}", .{
                 file.sub_file_path, header.instructions_len,
@@ -3716,17 +3659,17 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
                     .iov_len = header.extra_len * 4,
                 },
             };
-            const amt_read = try cache_file.?.readvAll(&iovecs);
+            const amt_read = try cache_file.readvAll(&iovecs);
             const amt_expected = zir.instructions.len * 9 +
                 zir.string_bytes.len +
                 zir.extra.len * 4;
             if (amt_read != amt_expected) {
                 log.warn("unexpected EOF reading cached ZIR for {s}", .{file.sub_file_path});
-                break :cached;
+                break :update;
             }
             if (data_has_safety_tag) {
                 const tags = zir.instructions.items(.tag);
-                for (zir.instructions.items(.data)) |*data, i| {
+                for (zir.instructions.items(.data), 0..) |*data, i| {
                     const union_tag = Zir.Inst.Tag.data_tags[@enumToInt(tags[i])];
                     const as_struct = @ptrCast(*HackDataLayout, data);
                     as_struct.* = .{
@@ -3758,42 +3701,22 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
                 return error.AnalysisFail;
             }
             return;
-        },
-        .parse_failure, .astgen_failure, .success_zir => {
-            const unchanged_metadata =
-                stat.size == file.stat.size and
-                stat.mtime == file.stat.mtime and
-                stat.inode == file.stat.inode;
+        }
 
-            if (unchanged_metadata) {
-                log.debug("unmodified metadata of file: {s}", .{file.sub_file_path});
-                return;
-            }
-
-            log.debug("metadata changed: {s}", .{file.sub_file_path});
-        },
+        // If we already have the exclusive lock then it is our job to update.
+        if (builtin.os.tag == .wasi or lock == .Exclusive) break;
+        // Otherwise, unlock to give someone a chance to get the exclusive lock
+        // and then upgrade to an exclusive lock.
+        cache_file.unlock();
+        lock = .Exclusive;
+        try cache_file.lock(lock);
     }
-    if (cache_file) |f| {
-        f.close();
-        cache_file = null;
-    }
-    cache_file = zir_dir.createFile(&digest, .{ .lock = .Exclusive }) catch |err| switch (err) {
-        error.NotDir => unreachable, // no dir components
-        error.InvalidUtf8 => unreachable, // it's a hex encoded name
-        error.BadPathName => unreachable, // it's a hex encoded name
-        error.NameTooLong => unreachable, // it's a fixed size name
-        error.PipeBusy => unreachable, // it's not a pipe
-        error.WouldBlock => unreachable, // not asking for non-blocking I/O
-        error.FileNotFound => unreachable, // no dir components
 
-        else => |e| {
-            const pkg_path = file.pkg.root_src_directory.path orelse ".";
-            const cache_path = cache_directory.path orelse ".";
-            log.warn("unable to save cached ZIR code for {s}/{s} to {s}/{s}: {s}", .{
-                pkg_path, file.sub_file_path, cache_path, &digest, @errorName(e),
-            });
-            return;
-        },
+    // The cache is definitely stale so delete the contents to avoid an underwrite later.
+    cache_file.setEndPos(0) catch |err| switch (err) {
+        error.FileTooBig => unreachable, // 0 is not too big
+
+        else => |e| return e,
     };
 
     mod.lockAndClearFileCompileError(file);
@@ -3832,68 +3755,10 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
     file.source = source;
     file.source_loaded = true;
 
-    file.tree = try std.zig.parse(gpa, source);
-    defer if (!file.tree_loaded) file.tree.deinit(gpa);
-
-    if (file.tree.errors.len != 0) {
-        const parse_err = file.tree.errors[0];
-
-        var msg = std.ArrayList(u8).init(gpa);
-        defer msg.deinit();
-
-        const token_starts = file.tree.tokens.items(.start);
-        const token_tags = file.tree.tokens.items(.tag);
-
-        const extra_offset = file.tree.errorOffset(parse_err);
-        try file.tree.renderError(parse_err, msg.writer());
-        const err_msg = try gpa.create(ErrorMsg);
-        err_msg.* = .{
-            .src_loc = .{
-                .file_scope = file,
-                .parent_decl_node = 0,
-                .lazy = if (extra_offset == 0) .{
-                    .token_abs = parse_err.token,
-                } else .{
-                    .byte_abs = token_starts[parse_err.token] + extra_offset,
-                },
-            },
-            .msg = try msg.toOwnedSlice(),
-        };
-        if (token_tags[parse_err.token + @boolToInt(parse_err.token_is_prev)] == .invalid) {
-            const bad_off = @intCast(u32, file.tree.tokenSlice(parse_err.token + @boolToInt(parse_err.token_is_prev)).len);
-            const byte_abs = token_starts[parse_err.token + @boolToInt(parse_err.token_is_prev)] + bad_off;
-            try mod.errNoteNonLazy(.{
-                .file_scope = file,
-                .parent_decl_node = 0,
-                .lazy = .{ .byte_abs = byte_abs },
-            }, err_msg, "invalid byte: '{'}'", .{std.zig.fmtEscapes(source[byte_abs..][0..1])});
-        }
-
-        for (file.tree.errors[1..]) |note| {
-            if (!note.is_note) break;
-
-            try file.tree.renderError(note, msg.writer());
-            err_msg.notes = try mod.gpa.realloc(err_msg.notes, err_msg.notes.len + 1);
-            err_msg.notes[err_msg.notes.len - 1] = .{
-                .src_loc = .{
-                    .file_scope = file,
-                    .parent_decl_node = 0,
-                    .lazy = .{ .token_abs = note.token },
-                },
-                .msg = try msg.toOwnedSlice(),
-            };
-        }
-
-        {
-            comp.mutex.lock();
-            defer comp.mutex.unlock();
-            try mod.failed_files.putNoClobber(gpa, file, err_msg);
-        }
-        file.status = .parse_failure;
-        return error.AnalysisFail;
-    }
+    file.tree = try Ast.parse(gpa, source, .zig);
     file.tree_loaded = true;
 
+    // Any potential AST errors are converted to ZIR errors here.
     file.zir = try AstGen.generate(gpa, file.tree);
     file.zir_loaded = true;
     file.status = .success_zir;
@@ -3913,7 +3778,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
         @ptrCast([*]const u8, file.zir.instructions.items(.data).ptr);
     if (data_has_safety_tag) {
         // The `Data` union has a safety tag but in the file format we store it without.
-        for (file.zir.instructions.items(.data)) |*data, i| {
+        for (file.zir.instructions.items(.data), 0..) |*data, i| {
             const as_struct = @ptrCast(*const HackDataLayout, data);
             safety_buffer[i] = as_struct.data;
         }
@@ -3950,7 +3815,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
             .iov_len = file.zir.extra.len * 4,
         },
     };
-    cache_file.?.writevAll(&iovecs) catch |err| {
+    cache_file.writevAll(&iovecs) catch |err| {
         const pkg_path = file.pkg.root_src_directory.path orelse ".";
         const cache_path = cache_directory.path orelse ".";
         log.warn("unable to write cached ZIR code for {s}/{s} to {s}/{s}: {s}", .{
@@ -4002,6 +3867,9 @@ fn updateZirRefs(mod: *Module, file: *File, old_zir: Zir) !void {
     const gpa = mod.gpa;
     const new_zir = file.zir;
 
+    // The root decl will be null if the previous ZIR had AST errors.
+    const root_decl = file.root_decl.unwrap() orelse return;
+
     // Maps from old ZIR to new ZIR, struct_decl, enum_decl, etc. Any instruction which
     // creates a namespace, gets mapped from old to new here.
     var inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index) = .{};
@@ -4019,7 +3887,6 @@ fn updateZirRefs(mod: *Module, file: *File, old_zir: Zir) !void {
     var decl_stack: ArrayListUnmanaged(Decl.Index) = .{};
     defer decl_stack.deinit(gpa);
 
-    const root_decl = file.root_decl.unwrap().?;
     try decl_stack.append(gpa, root_decl);
 
     file.deleted_decls.clearRetainingCapacity();
@@ -4147,7 +4014,7 @@ pub fn populateBuiltinFile(mod: *Module) !void {
         else => |e| return e,
     }
 
-    file.tree = try std.zig.parse(gpa, file.source);
+    file.tree = try Ast.parse(gpa, file.source, .zig);
     file.tree_loaded = true;
     assert(file.tree.errors.len == 0); // builtin.zig must parse
 
@@ -4258,7 +4125,7 @@ pub fn ensureDeclAnalyzed(mod: *Module, decl_index: Decl.Index) SemaError!void {
 
             // The exports this Decl performs will be re-discovered, so we remove them here
             // prior to re-analysis.
-            mod.deleteDeclExports(decl_index);
+            try mod.deleteDeclExports(decl_index);
 
             // Similarly, `@setAlignStack` invocations will be re-discovered.
             if (decl.getFunction()) |func| {
@@ -4396,7 +4263,7 @@ pub fn ensureFuncBodyAnalyzed(mod: *Module, func: *Fn) SemaError!void {
                 comp.emit_llvm_bc == null);
 
             const dump_air = builtin.mode == .Debug and comp.verbose_air;
-            const dump_llvm_ir = builtin.mode == .Debug and comp.verbose_llvm_ir;
+            const dump_llvm_ir = builtin.mode == .Debug and (comp.verbose_llvm_ir != null or comp.verbose_llvm_bc != null);
 
             if (no_bin_file and !dump_air and !dump_llvm_ir) return;
 
@@ -4610,8 +4477,17 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
 
     // We need the memory for the Type to go into the arena for the Decl
     var decl_arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer decl_arena.deinit();
     const decl_arena_allocator = decl_arena.allocator();
+
+    const decl_arena_state = blk: {
+        errdefer decl_arena.deinit();
+        const s = try decl_arena_allocator.create(std.heap.ArenaAllocator.State);
+        break :blk s;
+    };
+    defer {
+        decl_arena_state.* = decl_arena.state;
+        decl.value_arena = decl_arena_state;
+    }
 
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
@@ -4681,9 +4557,7 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
     // not the struct itself.
     try sema.resolveTypeLayout(decl_tv.ty);
 
-    const decl_arena_state = try decl_arena_allocator.create(std.heap.ArenaAllocator.State);
-
-    if (decl.is_usingnamespace) {
+    if (decl.kind == .@"usingnamespace") {
         if (!decl_tv.ty.eql(Type.type, mod)) {
             return sema.fail(&block_scope, ty_src, "expected type, found {}", .{
                 decl_tv.ty.fmt(mod),
@@ -4701,8 +4575,6 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
         decl.@"linksection" = null;
         decl.has_tv = true;
         decl.owns_tv = false;
-        decl_arena_state.* = decl_arena.state;
-        decl.value_arena = decl_arena_state;
         decl.analysis = .complete;
         decl.generation = mod.generation;
 
@@ -4723,16 +4595,14 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
                 if (decl.getFunction()) |prev_func| {
                     prev_is_inline = prev_func.state == .inline_only;
                 }
-                decl.clearValues(mod);
             }
+            decl.clearValues(mod);
 
             decl.ty = try decl_tv.ty.copy(decl_arena_allocator);
             decl.val = try decl_tv.val.copy(decl_arena_allocator);
             // linksection, align, and addrspace were already set by Sema
             decl.has_tv = true;
             decl.owns_tv = owns_tv;
-            decl_arena_state.* = decl_arena.state;
-            decl.value_arena = decl_arena_state;
             decl.analysis = .complete;
             decl.generation = mod.generation;
 
@@ -4742,7 +4612,6 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
                 // We don't fully codegen the decl until later, but we do need to reserve a global
                 // offset table index for it. This allows us to codegen decls out of dependency
                 // order, increasing how many computations can be done in parallel.
-                try mod.comp.bin_file.allocateDeclIndexes(decl_index);
                 try mod.comp.work_queue.writeItem(.{ .codegen_func = func });
                 if (type_changed and mod.emit_h != null) {
                     try mod.comp.work_queue.writeItem(.{ .emit_h_decl = decl_index });
@@ -4767,8 +4636,8 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
     var type_changed = true;
     if (decl.has_tv) {
         type_changed = !decl.ty.eql(decl_tv.ty, mod);
-        decl.clearValues(mod);
     }
+    decl.clearValues(mod);
 
     decl.owns_tv = false;
     var queue_linker_work = false;
@@ -4841,8 +4710,6 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
         };
     };
     decl.has_tv = true;
-    decl_arena_state.* = decl_arena.state;
-    decl.value_arena = decl_arena_state;
     decl.analysis = .complete;
     decl.generation = mod.generation;
 
@@ -4856,7 +4723,6 @@ fn semaDecl(mod: *Module, decl_index: Decl.Index) !bool {
         // codegen backend wants full access to the Decl Type.
         try sema.resolveTypeFully(decl.ty);
 
-        try mod.comp.bin_file.allocateDeclIndexes(decl_index);
         try mod.comp.work_queue.writeItem(.{ .codegen_decl = decl_index });
 
         if (type_changed and mod.emit_h != null) {
@@ -4900,6 +4766,7 @@ pub fn declareDeclDependency(mod: *Module, depender_index: Decl.Index, dependee_
 pub const ImportFileResult = struct {
     file: *File,
     is_new: bool,
+    is_pkg: bool,
 };
 
 pub fn importPkg(mod: *Module, pkg: *Package) !ImportFileResult {
@@ -4916,10 +4783,14 @@ pub fn importPkg(mod: *Module, pkg: *Package) !ImportFileResult {
 
     const gop = try mod.import_table.getOrPut(gpa, resolved_path);
     errdefer _ = mod.import_table.pop();
-    if (gop.found_existing) return ImportFileResult{
-        .file = gop.value_ptr.*,
-        .is_new = false,
-    };
+    if (gop.found_existing) {
+        try gop.value_ptr.*.addReference(mod.*, .{ .root = pkg });
+        return ImportFileResult{
+            .file = gop.value_ptr.*,
+            .is_new = false,
+            .is_pkg = true,
+        };
+    }
 
     const sub_file_path = try gpa.dupe(u8, pkg.root_src_path);
     errdefer gpa.free(sub_file_path);
@@ -4942,9 +4813,11 @@ pub fn importPkg(mod: *Module, pkg: *Package) !ImportFileResult {
         .pkg = pkg,
         .root_decl = .none,
     };
+    try new_file.addReference(mod.*, .{ .root = pkg });
     return ImportFileResult{
         .file = new_file,
         .is_new = true,
+        .is_pkg = true,
     };
 }
 
@@ -4985,6 +4858,7 @@ pub fn importFile(
     if (gop.found_existing) return ImportFileResult{
         .file = gop.value_ptr.*,
         .is_new = false,
+        .is_pkg = false,
     };
 
     const new_file = try gpa.create(File);
@@ -5030,17 +4904,35 @@ pub fn importFile(
     return ImportFileResult{
         .file = new_file,
         .is_new = true,
+        .is_pkg = false,
     };
 }
 
-pub fn embedFile(mod: *Module, cur_file: *File, rel_file_path: []const u8) !*EmbedFile {
+pub fn embedFile(mod: *Module, cur_file: *File, import_string: []const u8) !*EmbedFile {
     const gpa = mod.gpa;
 
-    // The resolved path is used as the key in the table, to detect if
-    // a file refers to the same as another, despite different relative paths.
+    if (cur_file.pkg.table.get(import_string)) |pkg| {
+        const resolved_path = try std.fs.path.resolve(gpa, &[_][]const u8{
+            pkg.root_src_directory.path orelse ".", pkg.root_src_path,
+        });
+        var keep_resolved_path = false;
+        defer if (!keep_resolved_path) gpa.free(resolved_path);
+
+        const gop = try mod.embed_table.getOrPut(gpa, resolved_path);
+        errdefer assert(mod.embed_table.remove(resolved_path));
+        if (gop.found_existing) return gop.value_ptr.*;
+
+        const sub_file_path = try gpa.dupe(u8, pkg.root_src_path);
+        errdefer gpa.free(sub_file_path);
+
+        return newEmbedFile(mod, pkg, sub_file_path, resolved_path, &keep_resolved_path, gop);
+    }
+
+    // The resolved path is used as the key in the table, to detect if a file
+    // refers to the same as another, despite different relative paths.
     const cur_pkg_dir_path = cur_file.pkg.root_src_directory.path orelse ".";
     const resolved_path = try std.fs.path.resolve(gpa, &[_][]const u8{
-        cur_pkg_dir_path, cur_file.sub_file_path, "..", rel_file_path,
+        cur_pkg_dir_path, cur_file.sub_file_path, "..", import_string,
     });
     var keep_resolved_path = false;
     defer if (!keep_resolved_path) gpa.free(resolved_path);
@@ -5048,9 +4940,6 @@ pub fn embedFile(mod: *Module, cur_file: *File, rel_file_path: []const u8) !*Emb
     const gop = try mod.embed_table.getOrPut(gpa, resolved_path);
     errdefer assert(mod.embed_table.remove(resolved_path));
     if (gop.found_existing) return gop.value_ptr.*;
-
-    const new_file = try gpa.create(EmbedFile);
-    errdefer gpa.destroy(new_file);
 
     const resolved_root_path = try std.fs.path.resolve(gpa, &[_][]const u8{cur_pkg_dir_path});
     defer gpa.free(resolved_root_path);
@@ -5070,7 +4959,23 @@ pub fn embedFile(mod: *Module, cur_file: *File, rel_file_path: []const u8) !*Emb
     };
     errdefer gpa.free(sub_file_path);
 
-    var file = try cur_file.pkg.root_src_directory.handle.openFile(sub_file_path, .{});
+    return newEmbedFile(mod, cur_file.pkg, sub_file_path, resolved_path, &keep_resolved_path, gop);
+}
+
+fn newEmbedFile(
+    mod: *Module,
+    pkg: *Package,
+    sub_file_path: []const u8,
+    resolved_path: []const u8,
+    keep_resolved_path: *bool,
+    gop: std.StringHashMapUnmanaged(*EmbedFile).GetOrPutResult,
+) !*EmbedFile {
+    const gpa = mod.gpa;
+
+    const new_file = try gpa.create(EmbedFile);
+    errdefer gpa.destroy(new_file);
+
+    var file = try pkg.root_src_directory.handle.openFile(sub_file_path, .{});
     defer file.close();
 
     const actual_stat = try file.stat();
@@ -5083,10 +4988,6 @@ pub fn embedFile(mod: *Module, cur_file: *File, rel_file_path: []const u8) !*Emb
     const bytes = try file.readToEndAllocOptions(gpa, std.math.maxInt(u32), size_usize, 1, 0);
     errdefer gpa.free(bytes);
 
-    log.debug("new embedFile. resolved_root_path={s}, resolved_path={s}, sub_file_path={s}, rel_file_path={s}", .{
-        resolved_root_path, resolved_path, sub_file_path, rel_file_path,
-    });
-
     if (mod.comp.whole_cache_manifest) |whole_cache_manifest| {
         const copied_resolved_path = try gpa.dupe(u8, resolved_path);
         errdefer gpa.free(copied_resolved_path);
@@ -5095,13 +4996,13 @@ pub fn embedFile(mod: *Module, cur_file: *File, rel_file_path: []const u8) !*Emb
         try whole_cache_manifest.addFilePostContents(copied_resolved_path, bytes, stat);
     }
 
-    keep_resolved_path = true; // It's now owned by embed_table.
+    keep_resolved_path.* = true; // It's now owned by embed_table.
     gop.value_ptr.* = new_file;
     new_file.* = .{
         .sub_file_path = sub_file_path,
         .bytes = bytes,
         .stat = stat,
-        .pkg = cur_file.pkg,
+        .pkg = pkg,
         .owner_decl = undefined, // Set by Sema immediately after this function returns.
     };
     return new_file;
@@ -5215,26 +5116,31 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) Allocator.Err
 
     // Every Decl needs a name.
     var is_named_test = false;
+    var kind: Decl.Kind = .named;
     const decl_name: [:0]const u8 = switch (decl_name_index) {
         0 => name: {
             if (export_bit) {
                 const i = iter.usingnamespace_index;
                 iter.usingnamespace_index += 1;
+                kind = .@"usingnamespace";
                 break :name try std.fmt.allocPrintZ(gpa, "usingnamespace_{d}", .{i});
             } else {
                 const i = iter.comptime_index;
                 iter.comptime_index += 1;
+                kind = .@"comptime";
                 break :name try std.fmt.allocPrintZ(gpa, "comptime_{d}", .{i});
             }
         },
         1 => name: {
             const i = iter.unnamed_test_index;
             iter.unnamed_test_index += 1;
+            kind = .@"test";
             break :name try std.fmt.allocPrintZ(gpa, "test_{d}", .{i});
         },
         2 => name: {
             is_named_test = true;
             const test_name = zir.nullTerminatedString(decl_doccomment_index);
+            kind = .@"test";
             break :name try std.fmt.allocPrintZ(gpa, "decltest.{s}", .{test_name});
         },
         else => name: {
@@ -5242,6 +5148,7 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) Allocator.Err
             if (raw_name.len == 0) {
                 is_named_test = true;
                 const test_name = zir.nullTerminatedString(decl_name_index + 1);
+                kind = .@"test";
                 break :name try std.fmt.allocPrintZ(gpa, "test.{s}", .{test_name});
             } else {
                 break :name try gpa.dupeZ(u8, raw_name);
@@ -5249,8 +5156,7 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) Allocator.Err
         },
     };
     const is_exported = export_bit and decl_name_index != 0;
-    const is_usingnamespace = export_bit and decl_name_index == 0;
-    if (is_usingnamespace) try namespace.usingnamespace_set.ensureUnusedCapacity(gpa, 1);
+    if (kind == .@"usingnamespace") try namespace.usingnamespace_set.ensureUnusedCapacity(gpa, 1);
 
     // We create a Decl for it regardless of analysis status.
     const gop = try namespace.decls.getOrPutContextAdapted(
@@ -5263,8 +5169,9 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) Allocator.Err
     if (!gop.found_existing) {
         const new_decl_index = try mod.allocateNewDecl(namespace, decl_node, iter.parent_decl.src_scope);
         const new_decl = mod.declPtr(new_decl_index);
+        new_decl.kind = kind;
         new_decl.name = decl_name;
-        if (is_usingnamespace) {
+        if (kind == .@"usingnamespace") {
             namespace.usingnamespace_set.putAssumeCapacity(new_decl_index, is_pub);
         }
         log.debug("scan new {*} ({s}) into {*}", .{ new_decl, decl_name, namespace });
@@ -5279,22 +5186,14 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) Allocator.Err
                 // test decl with no name. Skip the part where we check against
                 // the test name filter.
                 if (!comp.bin_file.options.is_test) break :blk false;
-                if (decl_pkg != mod.main_pkg) {
-                    if (!mod.main_pkg_is_std) break :blk false;
-                    const std_pkg = mod.main_pkg.table.get("std").?;
-                    if (std_pkg != decl_pkg) break :blk false;
-                }
+                if (decl_pkg != mod.main_pkg) break :blk false;
                 try mod.test_functions.put(gpa, new_decl_index, {});
                 break :blk true;
             },
             else => blk: {
                 if (!is_named_test) break :blk false;
                 if (!comp.bin_file.options.is_test) break :blk false;
-                if (decl_pkg != mod.main_pkg) {
-                    if (!mod.main_pkg_is_std) break :blk false;
-                    const std_pkg = mod.main_pkg.table.get("std").?;
-                    if (std_pkg != decl_pkg) break :blk false;
-                }
+                if (decl_pkg != mod.main_pkg) break :blk false;
                 if (comp.test_filter) |test_filter| {
                     if (mem.indexOf(u8, decl_name, test_filter) == null) {
                         break :blk false;
@@ -5309,7 +5208,6 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) Allocator.Err
         }
         new_decl.is_pub = is_pub;
         new_decl.is_exported = is_exported;
-        new_decl.is_usingnamespace = is_usingnamespace;
         new_decl.has_align = has_align;
         new_decl.has_linksection_or_addrspace = has_linksection_or_addrspace;
         new_decl.zir_decl_index = @intCast(u32, decl_sub_index);
@@ -5327,26 +5225,13 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) Allocator.Err
 
     decl.is_pub = is_pub;
     decl.is_exported = is_exported;
-    decl.is_usingnamespace = is_usingnamespace;
+    decl.kind = kind;
     decl.has_align = has_align;
     decl.has_linksection_or_addrspace = has_linksection_or_addrspace;
     decl.zir_decl_index = @intCast(u32, decl_sub_index);
     if (decl.getFunction()) |_| {
         switch (comp.bin_file.tag) {
-            .coff => {
-                // TODO Implement for COFF
-            },
-            .elf => if (decl.fn_link.elf.len != 0) {
-                // TODO Look into detecting when this would be unnecessary by storing enough state
-                // in `Decl` to notice that the line number did not change.
-                comp.work_queue.writeItemAssumeCapacity(.{ .update_line_number = decl_index });
-            },
-            .macho => if (decl.fn_link.macho.len != 0) {
-                // TODO Look into detecting when this would be unnecessary by storing enough state
-                // in `Decl` to notice that the line number did not change.
-                comp.work_queue.writeItemAssumeCapacity(.{ .update_line_number = decl_index });
-            },
-            .plan9 => {
+            .coff, .elf, .macho, .plan9 => {
                 // TODO Look into detecting when this would be unnecessary by storing enough state
                 // in `Decl` to notice that the line number did not change.
                 comp.work_queue.writeItemAssumeCapacity(.{ .update_line_number = decl_index });
@@ -5415,40 +5300,17 @@ pub fn clearDecl(
         assert(emit_h.decl_table.swapRemove(decl_index));
     }
     _ = mod.compile_log_decls.swapRemove(decl_index);
-    mod.deleteDeclExports(decl_index);
+    try mod.deleteDeclExports(decl_index);
 
     if (decl.has_tv) {
         if (decl.ty.isFnOrHasRuntimeBits()) {
             mod.comp.bin_file.freeDecl(decl_index);
-
-            // TODO instead of a union, put this memory trailing Decl objects,
-            // and allow it to be variably sized.
-            decl.link = switch (mod.comp.bin_file.tag) {
-                .coff => .{ .coff = link.File.Coff.Atom.empty },
-                .elf => .{ .elf = link.File.Elf.TextBlock.empty },
-                .macho => .{ .macho = link.File.MachO.Atom.empty },
-                .plan9 => .{ .plan9 = link.File.Plan9.DeclBlock.empty },
-                .c => .{ .c = {} },
-                .wasm => .{ .wasm = link.File.Wasm.DeclBlock.empty },
-                .spirv => .{ .spirv = {} },
-                .nvptx => .{ .nvptx = {} },
-            };
-            decl.fn_link = switch (mod.comp.bin_file.tag) {
-                .coff => .{ .coff = {} },
-                .elf => .{ .elf = link.File.Dwarf.SrcFn.empty },
-                .macho => .{ .macho = link.File.Dwarf.SrcFn.empty },
-                .plan9 => .{ .plan9 = {} },
-                .c => .{ .c = {} },
-                .wasm => .{ .wasm = link.File.Wasm.FnData.empty },
-                .spirv => .{ .spirv = .{} },
-                .nvptx => .{ .nvptx = {} },
-            };
         }
         if (decl.getInnerNamespace()) |namespace| {
             try namespace.deleteAllDecls(mod, outdated_decls);
         }
-        decl.clearValues(mod);
     }
+    decl.clearValues(mod);
 
     if (decl.deletion_flag) {
         decl.deletion_flag = false;
@@ -5462,23 +5324,6 @@ pub fn clearDecl(
 pub fn deleteUnusedDecl(mod: *Module, decl_index: Decl.Index) void {
     const decl = mod.declPtr(decl_index);
     log.debug("deleteUnusedDecl {d} ({s})", .{ decl_index, decl.name });
-
-    // TODO: remove `allocateDeclIndexes` and make the API that the linker backends
-    // are required to notice the first time `updateDecl` happens and keep track
-    // of it themselves. However they can rely on getting a `freeDecl` call if any
-    // `updateDecl` or `updateFunc` calls happen. This will allow us to avoid any call
-    // into the linker backend here, since the linker backend will never have been told
-    // about the Decl in the first place.
-    // Until then, we did call `allocateDeclIndexes` on this anonymous Decl and so we
-    // must call `freeDecl` in the linker backend now.
-    switch (mod.comp.bin_file.tag) {
-        .c => {}, // this linker backend has already migrated to the new API
-        else => if (decl.has_tv) {
-            if (decl.ty.isFnOrHasRuntimeBits()) {
-                mod.comp.bin_file.freeDecl(decl_index);
-            }
-        },
-    }
 
     assert(!mod.declIsRoot(decl_index));
     assert(decl.src_namespace.anon_decls.swapRemove(decl_index));
@@ -5525,7 +5370,7 @@ pub fn abortAnonDecl(mod: *Module, decl_index: Decl.Index) void {
 
 /// Delete all the Export objects that are caused by this Decl. Re-analysis of
 /// this Decl will cause them to be re-created (or not).
-fn deleteDeclExports(mod: *Module, decl_index: Decl.Index) void {
+fn deleteDeclExports(mod: *Module, decl_index: Decl.Index) Allocator.Error!void {
     var export_owners = (mod.export_owners.fetchSwapRemove(decl_index) orelse return).value;
 
     for (export_owners.items) |exp| {
@@ -5548,16 +5393,16 @@ fn deleteDeclExports(mod: *Module, decl_index: Decl.Index) void {
             }
         }
         if (mod.comp.bin_file.cast(link.File.Elf)) |elf| {
-            elf.deleteExport(exp.link.elf);
+            elf.deleteDeclExport(decl_index, exp.options.name);
         }
         if (mod.comp.bin_file.cast(link.File.MachO)) |macho| {
-            macho.deleteExport(exp.link.macho);
+            try macho.deleteDeclExport(decl_index, exp.options.name);
         }
         if (mod.comp.bin_file.cast(link.File.Wasm)) |wasm| {
-            wasm.deleteExport(exp.link.wasm);
+            wasm.deleteDeclExport(decl_index);
         }
         if (mod.comp.bin_file.cast(link.File.Coff)) |coff| {
-            coff.deleteExport(exp.link.coff);
+            coff.deleteDeclExport(decl_index, exp.options.name);
         }
         if (mod.failed_exports.fetchSwapRemove(exp)) |failed_kv| {
             failed_kv.value.destroy(mod.gpa);
@@ -5860,33 +5705,13 @@ pub fn allocateNewDecl(
         .deletion_flag = false,
         .zir_decl_index = 0,
         .src_scope = src_scope,
-        .link = switch (mod.comp.bin_file.tag) {
-            .coff => .{ .coff = link.File.Coff.Atom.empty },
-            .elf => .{ .elf = link.File.Elf.TextBlock.empty },
-            .macho => .{ .macho = link.File.MachO.Atom.empty },
-            .plan9 => .{ .plan9 = link.File.Plan9.DeclBlock.empty },
-            .c => .{ .c = {} },
-            .wasm => .{ .wasm = link.File.Wasm.DeclBlock.empty },
-            .spirv => .{ .spirv = {} },
-            .nvptx => .{ .nvptx = {} },
-        },
-        .fn_link = switch (mod.comp.bin_file.tag) {
-            .coff => .{ .coff = {} },
-            .elf => .{ .elf = link.File.Dwarf.SrcFn.empty },
-            .macho => .{ .macho = link.File.Dwarf.SrcFn.empty },
-            .plan9 => .{ .plan9 = {} },
-            .c => .{ .c = {} },
-            .wasm => .{ .wasm = link.File.Wasm.FnData.empty },
-            .spirv => .{ .spirv = .{} },
-            .nvptx => .{ .nvptx = {} },
-        },
         .generation = 0,
         .is_pub = false,
         .is_exported = false,
         .has_linksection_or_addrspace = false,
         .has_align = false,
         .alive = false,
-        .is_usingnamespace = false,
+        .kind = .anon,
     };
 
     return decl_and_index.decl_index;
@@ -5964,7 +5789,6 @@ pub fn initNewAnonDecl(
     // the Decl will be garbage collected by the `codegen_decl` task instead of sent
     // to the linker.
     if (typed_value.ty.isFnOrHasRuntimeBits()) {
-        try mod.comp.bin_file.allocateDeclIndexes(new_decl_index);
         try mod.comp.anon_work_queue.writeItem(.{ .codegen_decl = new_decl_index });
     }
 }
@@ -6061,11 +5885,7 @@ pub const SwitchProngSrc = union(enum) {
         var multi_i: u32 = 0;
         var scalar_i: u32 = 0;
         for (case_nodes) |case_node| {
-            const case = switch (node_tags[case_node]) {
-                .switch_case_one, .switch_case_inline_one => tree.switchCaseOne(case_node),
-                .switch_case, .switch_case_inline => tree.switchCase(case_node),
-                else => unreachable,
-            };
+            const case = tree.fullSwitchCase(case_node).?;
             if (case.ast.values.len == 0)
                 continue;
             if (case.ast.values.len == 1 and
@@ -6129,7 +5949,7 @@ pub const PeerTypeCandidateSrc = union(enum) {
     none: void,
     /// When we want to know the the src of candidate i, look up at
     /// index i in this slice
-    override: []LazySrcLoc,
+    override: []?LazySrcLoc,
     /// resolvePeerTypes originates from a @TypeOf(...) call
     typeof_builtin_call_node_offset: i32,
 
@@ -6178,7 +5998,7 @@ pub const PeerTypeCandidateSrc = union(enum) {
 
 const FieldSrcQuery = struct {
     index: usize,
-    range: enum { name, type, value, alignment },
+    range: enum { name, type, value, alignment } = .name,
 };
 
 fn queryFieldSrc(
@@ -6187,15 +6007,9 @@ fn queryFieldSrc(
     file_scope: *File,
     container_decl: Ast.full.ContainerDecl,
 ) SrcLoc {
-    const node_tags = tree.nodes.items(.tag);
     var field_index: usize = 0;
     for (container_decl.ast.members) |member_node| {
-        const field = switch (node_tags[member_node]) {
-            .container_field_init => tree.containerFieldInit(member_node),
-            .container_field_align => tree.containerFieldAlign(member_node),
-            .container_field => tree.containerField(member_node),
-            else => continue,
-        };
+        const field = tree.fullContainerField(member_node) orelse continue;
         if (field_index == query.index) {
             return switch (query.range) {
                 .name => .{
@@ -6239,24 +6053,9 @@ pub fn paramSrc(
         });
         return LazySrcLoc.nodeOffset(0);
     };
-    const node_datas = tree.nodes.items(.data);
-    const node_tags = tree.nodes.items(.tag);
     const node = decl.relativeToNodeIndex(func_node_offset);
-    var params: [1]Ast.Node.Index = undefined;
-    const full = switch (node_tags[node]) {
-        .fn_proto_simple => tree.fnProtoSimple(&params, node),
-        .fn_proto_multi => tree.fnProtoMulti(node),
-        .fn_proto_one => tree.fnProtoOne(&params, node),
-        .fn_proto => tree.fnProto(node),
-        .fn_decl => switch (node_tags[node_datas[node].lhs]) {
-            .fn_proto_simple => tree.fnProtoSimple(&params, node_datas[node].lhs),
-            .fn_proto_multi => tree.fnProtoMulti(node_datas[node].lhs),
-            .fn_proto_one => tree.fnProtoOne(&params, node_datas[node].lhs),
-            .fn_proto => tree.fnProto(node_datas[node].lhs),
-            else => unreachable,
-        },
-        else => unreachable,
-    };
+    var buf: [1]Ast.Node.Index = undefined;
+    const full = tree.fullFnProto(&buf, node).?;
     var it = full.iterate(tree);
     var i: usize = 0;
     while (it.next()) |param| : (i += 1) {
@@ -6322,18 +6121,6 @@ pub fn initSrc(
     const node_tags = tree.nodes.items(.tag);
     const node = decl.relativeToNodeIndex(init_node_offset);
     var buf: [2]Ast.Node.Index = undefined;
-    const full = switch (node_tags[node]) {
-        .array_init_one, .array_init_one_comma => tree.arrayInitOne(buf[0..1], node).ast.elements,
-        .array_init_dot_two, .array_init_dot_two_comma => tree.arrayInitDotTwo(&buf, node).ast.elements,
-        .array_init_dot, .array_init_dot_comma => tree.arrayInitDot(node).ast.elements,
-        .array_init, .array_init_comma => tree.arrayInit(node).ast.elements,
-
-        .struct_init_one, .struct_init_one_comma => tree.structInitOne(buf[0..1], node).ast.fields,
-        .struct_init_dot_two, .struct_init_dot_two_comma => tree.structInitDotTwo(&buf, node).ast.fields,
-        .struct_init_dot, .struct_init_dot_comma => tree.structInitDot(node).ast.fields,
-        .struct_init, .struct_init_comma => tree.structInit(node).ast.fields,
-        else => return LazySrcLoc.nodeOffset(init_node_offset),
-    };
     switch (node_tags[node]) {
         .array_init_one,
         .array_init_one_comma,
@@ -6343,7 +6130,10 @@ pub fn initSrc(
         .array_init_dot_comma,
         .array_init,
         .array_init_comma,
-        => return LazySrcLoc.nodeOffset(decl.nodeIndexToRelative(full[init_index])),
+        => {
+            const full = tree.fullArrayInit(&buf, node).?.ast.elements;
+            return LazySrcLoc.nodeOffset(decl.nodeIndexToRelative(full[init_index]));
+        },
         .struct_init_one,
         .struct_init_one_comma,
         .struct_init_dot_two,
@@ -6352,8 +6142,11 @@ pub fn initSrc(
         .struct_init_dot_comma,
         .struct_init,
         .struct_init_comma,
-        => return LazySrcLoc{ .node_offset_initializer = decl.nodeIndexToRelative(full[init_index]) },
-        else => unreachable,
+        => {
+            const full = tree.fullStructInit(&buf, node).?.ast.fields;
+            return LazySrcLoc{ .node_offset_initializer = decl.nodeIndexToRelative(full[init_index]) };
+        },
+        else => return LazySrcLoc.nodeOffset(init_node_offset),
     }
 }
 
@@ -6386,13 +6179,7 @@ pub fn optionsSrc(gpa: Allocator, decl: *Decl, base_src: LazySrcLoc, wanted: []c
         else => unreachable,
     };
     var buf: [2]std.zig.Ast.Node.Index = undefined;
-    const init_nodes = switch (node_tags[arg_node]) {
-        .struct_init_one, .struct_init_one_comma => tree.structInitOne(buf[0..1], arg_node).ast.fields,
-        .struct_init_dot_two, .struct_init_dot_two_comma => tree.structInitDotTwo(&buf, arg_node).ast.fields,
-        .struct_init_dot, .struct_init_dot_comma => tree.structInitDot(arg_node).ast.fields,
-        .struct_init, .struct_init_comma => tree.structInit(arg_node).ast.fields,
-        else => return base_src,
-    };
+    const init_nodes = if (tree.fullStructInit(&buf, arg_node)) |struct_init| struct_init.ast.fields else return base_src;
     for (init_nodes) |init_node| {
         // . IDENTIFIER = init_node
         const name_token = tree.firstToken(init_node) - 2;
@@ -6541,7 +6328,7 @@ pub fn populateTestFunctions(
         // Add a dependency on each test name and function pointer.
         try array_decl.dependencies.ensureUnusedCapacity(gpa, test_fn_vals.len * 2);
 
-        for (mod.test_functions.keys()) |test_decl_index, i| {
+        for (mod.test_functions.keys(), 0..) |test_decl_index, i| {
             const test_decl = mod.declPtr(test_decl_index);
             const test_name_slice = mem.sliceTo(test_decl.name, 0);
             const test_name_decl_index = n: {
@@ -6608,7 +6395,7 @@ pub fn linkerUpdateDecl(mod: *Module, decl_index: Decl.Index) !void {
         comp.emit_llvm_ir == null and
         comp.emit_llvm_bc == null);
 
-    const dump_llvm_ir = builtin.mode == .Debug and comp.verbose_llvm_ir;
+    const dump_llvm_ir = builtin.mode == .Debug and (comp.verbose_llvm_ir != null or comp.verbose_llvm_bc != null);
 
     if (no_bin_file and !dump_llvm_ir) return;
 
@@ -6747,4 +6534,28 @@ pub fn getDeclExports(mod: Module, decl_index: Decl.Index) []const *Export {
     } else {
         return &[0]*Export{};
     }
+}
+
+pub const Feature = enum {
+    panic_fn,
+    panic_unwrap_error,
+    safety_check_formatted,
+    error_return_trace,
+    is_named_enum_value,
+    error_set_has_value,
+    field_reordering,
+};
+
+pub fn backendSupportsFeature(mod: Module, feature: Feature) bool {
+    return switch (feature) {
+        .panic_fn => mod.comp.bin_file.options.target.ofmt == .c or
+            mod.comp.bin_file.options.use_llvm,
+        .panic_unwrap_error => mod.comp.bin_file.options.target.ofmt == .c or
+            mod.comp.bin_file.options.use_llvm,
+        .safety_check_formatted => mod.comp.bin_file.options.use_llvm,
+        .error_return_trace => mod.comp.bin_file.options.use_llvm,
+        .is_named_enum_value => mod.comp.bin_file.options.use_llvm,
+        .error_set_has_value => mod.comp.bin_file.options.use_llvm,
+        .field_reordering => mod.comp.bin_file.options.use_llvm,
+    };
 }

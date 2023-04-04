@@ -160,7 +160,6 @@ test "implicit casting between C pointer and optional non-C pointer" {
 }
 
 test "implicit cast error unions with non-optional to optional pointer" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -190,7 +189,6 @@ test "compare equality of optional and non-optional pointer" {
 test "allowzero pointer and slice" {
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -413,7 +411,6 @@ test "@ptrToInt on null optional at comptime" {
 test "indexing array with sentinel returns correct type" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     var s: [:0]const u8 = "abc";
@@ -498,7 +495,6 @@ test "pointer to constant decl preserves alignment" {
 test "ptrCast comptime known slice to C pointer" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const s: [:0]const u8 = "foo";
@@ -507,10 +503,9 @@ test "ptrCast comptime known slice to C pointer" {
 }
 
 test "ptrToInt on a generic function" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_aarch64 and builtin.os.tag != .linux) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64 and builtin.os.tag != .linux) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
 
     const S = struct {
         fn generic(i: anytype) @TypeOf(i) {
@@ -521,4 +516,29 @@ test "ptrToInt on a generic function" {
         }
     };
     try S.doTheTest(&S.generic);
+}
+
+test "pointer alignment and element type include call expression" {
+    const S = struct {
+        fn T() type {
+            return struct { _: i32 };
+        }
+        const P = *align(@alignOf(T())) [@sizeOf(T())]u8;
+    };
+    try expect(@alignOf(S.P) > 0);
+}
+
+test "pointer to array has explicit alignment" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
+
+    const S = struct {
+        const Base = extern struct { a: u8 };
+        const Base2 = extern struct { a: u8 };
+        fn func(ptr: *[4]Base) *align(1) [4]Base2 {
+            return @alignCast(1, @ptrCast(*[4]Base2, ptr));
+        }
+    };
+    var bases = [_]S.Base{.{ .a = 2 }} ** 4;
+    const casted = S.func(&bases);
+    try expect(casted[0].a == 2);
 }

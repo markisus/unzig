@@ -16,6 +16,8 @@ pub const Mutex = @import("Thread/Mutex.zig");
 pub const Semaphore = @import("Thread/Semaphore.zig");
 pub const Condition = @import("Thread/Condition.zig");
 pub const RwLock = @import("Thread/RwLock.zig");
+pub const Pool = @import("Thread/Pool.zig");
+pub const WaitGroup = @import("Thread/WaitGroup.zig");
 
 pub const use_pthreads = target.os.tag != .windows and target.os.tag != .wasi and builtin.link_libc;
 const is_gnu = target.abi.isGnu();
@@ -166,7 +168,7 @@ pub const GetNameError = error{
 
 pub fn getName(self: Thread, buffer_ptr: *[max_name_len:0]u8) GetNameError!?[]const u8 {
     buffer_ptr[max_name_len] = 0;
-    var buffer = std.mem.span(buffer_ptr);
+    var buffer: [:0]u8 = buffer_ptr;
 
     switch (target.os.tag) {
         .linux => if (use_pthreads and is_gnu) {
@@ -255,8 +257,19 @@ pub fn getName(self: Thread, buffer_ptr: *[max_name_len:0]u8) GetNameError!?[]co
     return error.Unsupported;
 }
 
-/// Represents a unique ID per thread.
-pub const Id = u64;
+/// Represents an ID per thread guaranteed to be unique only within a process.
+pub const Id = switch (target.os.tag) {
+    .linux,
+    .dragonfly,
+    .netbsd,
+    .freebsd,
+    .openbsd,
+    .haiku,
+    => u32,
+    .macos, .ios, .watchos, .tvos => u64,
+    .windows => os.windows.DWORD,
+    else => usize,
+};
 
 /// Returns the platform ID of the callers thread.
 /// Attempts to use thread locals and avoid syscalls when possible.
@@ -431,7 +444,7 @@ fn callFn(comptime f: anytype, args: anytype) switch (Impl) {
 const UnsupportedImpl = struct {
     pub const ThreadHandle = void;
 
-    fn getCurrentId() u64 {
+    fn getCurrentId() usize {
         return unsupported({});
     }
 
@@ -466,7 +479,7 @@ const WindowsThreadImpl = struct {
 
     pub const ThreadHandle = windows.HANDLE;
 
-    fn getCurrentId() u64 {
+    fn getCurrentId() windows.DWORD {
         return windows.kernel32.GetCurrentThreadId();
     }
 
@@ -934,6 +947,7 @@ const LinuxThreadImpl = struct {
 
         // map all memory needed without read/write permissions
         // to avoid committing the whole region right away
+        // anonymous mapping ensures file descriptor limits are not exceeded
         const mapped = os.mmap(
             null,
             map_bytes,
@@ -945,6 +959,8 @@ const LinuxThreadImpl = struct {
             error.MemoryMappingNotSupported => unreachable,
             error.AccessDenied => unreachable,
             error.PermissionDenied => unreachable,
+            error.ProcessFdQuotaExceeded => unreachable,
+            error.SystemFdQuotaExceeded => unreachable,
             else => |e| return e,
         };
         assert(mapped.len >= map_bytes);

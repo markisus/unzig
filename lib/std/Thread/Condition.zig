@@ -161,12 +161,20 @@ const WindowsImpl = struct {
             }
         }
 
+        if (comptime builtin.mode == .Debug) {
+            // The internal state of the DebugMutex needs to be handled here as well.
+            mutex.impl.locking_thread.store(0, .Unordered);
+        }
         const rc = os.windows.kernel32.SleepConditionVariableSRW(
             &self.condition,
-            &mutex.impl.srwlock,
+            if (comptime builtin.mode == .Debug) &mutex.impl.impl.srwlock else &mutex.impl.srwlock,
             timeout_ms,
             0, // the srwlock was assumed to acquired in exclusive mode not shared
         );
+        if (comptime builtin.mode == .Debug) {
+            // The internal state of the DebugMutex needs to be handled here as well.
+            mutex.impl.locking_thread.store(std.Thread.getCurrentId(), .Unordered);
+        }
 
         // Return error.Timeout if we know the timeout elapsed correctly.
         if (rc == os.windows.FALSE) {
@@ -333,7 +341,7 @@ test "Condition - wait and signal" {
     };
 
     var multi_wait = MultiWait{};
-    for (multi_wait.threads) |*t| {
+    for (&multi_wait.threads) |*t| {
         t.* = try std.Thread.spawn(.{}, MultiWait.run, .{&multi_wait});
     }
 
@@ -381,7 +389,7 @@ test "Condition - signal" {
     };
 
     var signal_test = SignalTest{};
-    for (signal_test.threads) |*t| {
+    for (&signal_test.threads) |*t| {
         t.* = try std.Thread.spawn(.{}, SignalTest.run, .{&signal_test});
     }
 
@@ -449,7 +457,7 @@ test "Condition - multi signal" {
     var threads = [_]std.Thread{undefined} ** num_threads;
 
     // Create a circle of paddles which hit each other
-    for (threads) |*t, i| {
+    for (&threads, 0..) |*t, i| {
         const paddle = &paddles[i];
         const hit_to = &paddles[(i + 1) % paddles.len];
         t.* = try std.Thread.spawn(.{}, Paddle.run, .{ paddle, hit_to });
@@ -460,7 +468,7 @@ test "Condition - multi signal" {
     for (threads) |t| t.join();
 
     // The first paddle will be hit one last time by the last paddle.
-    for (paddles) |p, i| {
+    for (paddles, 0..) |p, i| {
         const expected = @as(u32, num_iterations) + @boolToInt(i == 0);
         try testing.expectEqual(p.value, expected);
     }
@@ -505,7 +513,7 @@ test "Condition - broadcasting" {
     };
 
     var broadcast_test = BroadcastTest{};
-    for (broadcast_test.threads) |*t| {
+    for (&broadcast_test.threads) |*t| {
         t.* = try std.Thread.spawn(.{}, BroadcastTest.run, .{&broadcast_test});
     }
 
@@ -576,7 +584,7 @@ test "Condition - broadcasting - wake all threads" {
 
         var broadcast_test = BroadcastTest{};
         var thread_id: usize = 1;
-        for (broadcast_test.threads) |*t| {
+        for (&broadcast_test.threads) |*t| {
             t.* = try std.Thread.spawn(.{}, BroadcastTest.run, .{ &broadcast_test, thread_id });
             thread_id += 1;
         }

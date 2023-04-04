@@ -48,7 +48,7 @@ fn joinSepMaybeZ(allocator: Allocator, separator: u8, comptime sepPredicate: fn 
 
     // Find first non-empty path index.
     const first_path_index = blk: {
-        for (paths) |path, index| {
+        for (paths, 0..) |path, index| {
             if (path.len == 0) continue else break :blk index;
         }
 
@@ -460,7 +460,7 @@ pub fn resolve(allocator: Allocator, paths: []const []const u8) ![]u8 {
 }
 
 /// This function is like a series of `cd` statements executed one after another.
-/// It resolves "." and "..".
+/// It resolves "." and "..", but will not convert relative path to absolute path, use std.fs.Dir.realpath instead.
 /// The result does not have a trailing path separator.
 /// Each drive has its own current working directory.
 /// Path separators are canonicalized to '\\' and drives are canonicalized to capital letters.
@@ -476,7 +476,7 @@ pub fn resolveWindows(allocator: Allocator, paths: []const []const u8) ![]u8 {
     var drive_kind = WindowsPath.Kind.None;
     var have_abs_path = false;
     var first_index: usize = 0;
-    for (paths) |p, i| {
+    for (paths, 0..) |p, i| {
         const parsed = windowsParsePath(p);
         if (parsed.is_abs) {
             have_abs_path = true;
@@ -504,7 +504,7 @@ pub fn resolveWindows(allocator: Allocator, paths: []const []const u8) ![]u8 {
         first_index = 0;
         var correct_disk_designator = false;
 
-        for (paths) |p, i| {
+        for (paths, 0..) |p, i| {
             const parsed = windowsParsePath(p);
             if (parsed.kind != WindowsPath.Kind.None) {
                 if (parsed.kind == drive_kind) {
@@ -637,7 +637,7 @@ pub fn resolveWindows(allocator: Allocator, paths: []const []const u8) ![]u8 {
 }
 
 /// This function is like a series of `cd` statements executed one after another.
-/// It resolves "." and "..".
+/// It resolves "." and "..", but will not convert relative path to absolute path, use std.fs.Dir.realpath instead.
 /// The result does not have a trailing path separator.
 /// This function does not perform any syscalls. Executing this series of path
 /// lookups on the actual filesystem may produce different results due to
@@ -1046,11 +1046,13 @@ pub fn relative(allocator: Allocator, from: []const u8, to: []const u8) ![]u8 {
 }
 
 pub fn relativeWindows(allocator: Allocator, from: []const u8, to: []const u8) ![]u8 {
-    const resolved_from = try resolveWindows(allocator, &[_][]const u8{from});
+    const cwd = try process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    const resolved_from = try resolveWindows(allocator, &[_][]const u8{ cwd, from });
     defer allocator.free(resolved_from);
 
     var clean_up_resolved_to = true;
-    const resolved_to = try resolveWindows(allocator, &[_][]const u8{to});
+    const resolved_to = try resolveWindows(allocator, &[_][]const u8{ cwd, to });
     defer if (clean_up_resolved_to) allocator.free(resolved_to);
 
     const parsed_from = windowsParsePath(resolved_from);
@@ -1096,12 +1098,8 @@ pub fn relativeWindows(allocator: Allocator, from: []const u8, to: []const u8) !
 
         var result_index: usize = 0;
         while (result_index < up_index_end) {
-            result[result_index] = '.';
-            result_index += 1;
-            result[result_index] = '.';
-            result_index += 1;
-            result[result_index] = '\\';
-            result_index += 1;
+            result[result_index..][0..3].* = "..\\".*;
+            result_index += 3;
         }
         // shave off the trailing slash
         result_index -= 1;
@@ -1121,10 +1119,11 @@ pub fn relativeWindows(allocator: Allocator, from: []const u8, to: []const u8) !
 }
 
 pub fn relativePosix(allocator: Allocator, from: []const u8, to: []const u8) ![]u8 {
-    const resolved_from = try resolvePosix(allocator, &[_][]const u8{from});
+    const cwd = try process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    const resolved_from = try resolvePosix(allocator, &[_][]const u8{ cwd, from });
     defer allocator.free(resolved_from);
-
-    const resolved_to = try resolvePosix(allocator, &[_][]const u8{to});
+    const resolved_to = try resolvePosix(allocator, &[_][]const u8{ cwd, to });
     defer allocator.free(resolved_to);
 
     var from_it = mem.tokenize(u8, resolved_from, "/");
@@ -1146,12 +1145,8 @@ pub fn relativePosix(allocator: Allocator, from: []const u8, to: []const u8) ![]
 
         var result_index: usize = 0;
         while (result_index < up_index_end) {
-            result[result_index] = '.';
-            result_index += 1;
-            result[result_index] = '.';
-            result_index += 1;
-            result[result_index] = '/';
-            result_index += 1;
+            result[result_index..][0..3].* = "../".*;
+            result_index += 3;
         }
         if (to_rest.len == 0) {
             // shave off the trailing slash

@@ -9,6 +9,7 @@ const assert = std.debug.assert;
 const testing = std.testing;
 const child_process = @import("child_process.zig");
 
+pub const Child = child_process.ChildProcess;
 pub const abort = os.abort;
 pub const exit = os.exit;
 pub const changeCurDir = os.chdir;
@@ -293,6 +294,10 @@ pub fn getEnvMap(allocator: Allocator) !EnvMap {
             return os.unexpectedErrno(environ_sizes_get_ret);
         }
 
+        if (environ_count == 0) {
+            return result;
+        }
+
         var environ = try allocator.alloc([*:0]u8, environ_count);
         defer allocator.free(environ);
         var environ_buf = try allocator.alloc(u8, environ_buf_size);
@@ -369,6 +374,11 @@ pub fn getEnvVarOwned(allocator: Allocator, key: []const u8) GetEnvVarOwnedError
             error.UnexpectedSecondSurrogateHalf => return error.InvalidUtf8,
             else => |e| return e,
         };
+    } else if (builtin.os.tag == .wasi and !builtin.link_libc) {
+        var envmap = getEnvMap(allocator) catch return error.OutOfMemory;
+        defer envmap.deinit();
+        const val = envmap.get(key) orelse return error.EnvironmentVariableNotFound;
+        return allocator.dupe(u8, val);
     } else {
         const result = os.getenv(key) orelse return error.EnvironmentVariableNotFound;
         return allocator.dupe(u8, result);
@@ -379,6 +389,8 @@ pub fn hasEnvVarConstant(comptime key: []const u8) bool {
     if (builtin.os.tag == .windows) {
         const key_w = comptime std.unicode.utf8ToUtf16LeStringLiteral(key);
         return std.os.getenvW(key_w) != null;
+    } else if (builtin.os.tag == .wasi and !builtin.link_libc) {
+        @compileError("hasEnvVarConstant is not supported for WASI without libc");
     } else {
         return os.getenv(key) != null;
     }
@@ -390,6 +402,10 @@ pub fn hasEnvVar(allocator: Allocator, key: []const u8) error{OutOfMemory}!bool 
         const key_w = try std.unicode.utf8ToUtf16LeWithNull(stack_alloc.get(), key);
         defer stack_alloc.allocator.free(key_w);
         return std.os.getenvW(key_w) != null;
+    } else if (builtin.os.tag == .wasi and !builtin.link_libc) {
+        var envmap = getEnvMap(allocator) catch return error.OutOfMemory;
+        defer envmap.deinit();
+        return envmap.getPtr(key) != null;
     } else {
         return os.getenv(key) != null;
     }
@@ -455,6 +471,10 @@ pub const ArgIteratorWasi = struct {
         switch (w.args_sizes_get(&count, &buf_size)) {
             .SUCCESS => {},
             else => |err| return os.unexpectedErrno(err),
+        }
+
+        if (count == 0) {
+            return &[_][:0]u8{};
         }
 
         var argv = try allocator.alloc([*:0]u8, count);
@@ -808,24 +828,6 @@ pub fn argsWithAllocator(allocator: Allocator) ArgIterator.InitError!ArgIterator
     return ArgIterator.initWithAllocator(allocator);
 }
 
-test "args iterator" {
-    var ga = std.testing.allocator;
-    var it = try argsWithAllocator(ga);
-    defer it.deinit(); // no-op unless WASI or Windows
-
-    const prog_name = it.next() orelse unreachable;
-    const expected_suffix = switch (builtin.os.tag) {
-        .wasi => "test.wasm",
-        .windows => "test.exe",
-        else => "test",
-    };
-    const given_suffix = std.fs.path.basename(prog_name);
-
-    try testing.expect(mem.eql(u8, expected_suffix, given_suffix));
-    try testing.expect(it.next() == null);
-    try testing.expect(!it.skip());
-}
-
 /// Caller must call argsFree on result.
 pub fn argsAlloc(allocator: Allocator) ![][:0]u8 {
     // TODO refactor to only make 1 allocation.
@@ -855,7 +857,7 @@ pub fn argsAlloc(allocator: Allocator) ![][:0]u8 {
     mem.copy(u8, result_contents, contents_slice);
 
     var contents_index: usize = 0;
-    for (slice_sizes) |len, i| {
+    for (slice_sizes, 0..) |len, i| {
         const new_index = contents_index + len;
         result_slice_list[i] = result_contents[contents_index..new_index :0];
         contents_index = new_index + 1;
@@ -1091,7 +1093,7 @@ pub const can_execv = switch (builtin.os.tag) {
 
 /// Tells whether spawning child processes is supported (e.g. via ChildProcess)
 pub const can_spawn = switch (builtin.os.tag) {
-    .wasi => false,
+    .wasi, .watchos, .tvos => false,
     else => true,
 };
 
@@ -1129,7 +1131,7 @@ pub fn execve(
     const arena = arena_allocator.allocator();
 
     const argv_buf = try arena.allocSentinel(?[*:0]u8, argv.len, null);
-    for (argv) |arg, i| argv_buf[i] = (try arena.dupeZ(u8, arg)).ptr;
+    for (argv, 0..) |arg, i| argv_buf[i] = (try arena.dupeZ(u8, arg)).ptr;
 
     const envp = m: {
         if (env_map) |m| {
@@ -1148,4 +1150,52 @@ pub fn execve(
     };
 
     return os.execvpeZ_expandArg0(.no_expand, argv_buf.ptr[0].?, argv_buf.ptr, envp);
+}
+
+pub const TotalSystemMemoryError = error{
+    UnknownTotalSystemMemory,
+};
+
+/// Returns the total system memory, in bytes.
+pub fn totalSystemMemory() TotalSystemMemoryError!usize {
+    switch (builtin.os.tag) {
+        .linux => {
+            return totalSystemMemoryLinux() catch return error.UnknownTotalSystemMemory;
+        },
+        .windows => {
+            var kilobytes: std.os.windows.ULONGLONG = undefined;
+            assert(std.os.windows.kernel32.GetPhysicallyInstalledSystemMemory(&kilobytes) == std.os.windows.TRUE);
+            return kilobytes * 1024;
+        },
+        else => return error.UnknownTotalSystemMemory,
+    }
+}
+
+fn totalSystemMemoryLinux() !usize {
+    var file = try std.fs.openFileAbsoluteZ("/proc/meminfo", .{});
+    defer file.close();
+    var buf: [50]u8 = undefined;
+    const amt = try file.read(&buf);
+    if (amt != 50) return error.Unexpected;
+    var it = std.mem.tokenize(u8, buf[0..amt], " \n");
+    const label = it.next().?;
+    if (!std.mem.eql(u8, label, "MemTotal:")) return error.Unexpected;
+    const int_text = it.next() orelse return error.Unexpected;
+    const units = it.next() orelse return error.Unexpected;
+    if (!std.mem.eql(u8, units, "kB")) return error.Unexpected;
+    const kilobytes = try std.fmt.parseInt(usize, int_text, 10);
+    return kilobytes * 1024;
+}
+
+/// Indicate that we are now terminating with a successful exit code.
+/// In debug builds, this is a no-op, so that the calling code's
+/// cleanup mechanisms are tested and so that external tools that
+/// check for resource leaks can be accurate. In release builds, this
+/// calls exit(0), and does not return.
+pub fn cleanExit() void {
+    if (builtin.mode == .Debug) {
+        return;
+    } else {
+        exit(0);
+    }
 }

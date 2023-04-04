@@ -232,7 +232,14 @@ pub const Inst = struct {
         /// Result type is always noreturn; no instructions in a block follow this one.
         /// Uses the `br` field.
         br,
-        /// Lowers to a hardware trap instruction, or the next best thing.
+        /// Lowers to a trap/jam instruction causing program abortion.
+        /// This may lower to an instruction known to be invalid.
+        /// Sometimes, for the lack of a better instruction, `trap` and `breakpoint` may compile down to the same code.
+        /// Result type is always noreturn; no instructions in a block follow this one.
+        trap,
+        /// Lowers to a trap instruction causing debuggers to break here, or the next best thing.
+        /// The debugger or something else may allow the program to resume after this point.
+        /// Sometimes, for the lack of a better instruction, `trap` and `breakpoint` may compile down to the same code.
         /// Result type is always void.
         breakpoint,
         /// Yields the return address of the current function.
@@ -754,6 +761,22 @@ pub const Inst = struct {
         /// Uses the `ty` field.
         c_va_start,
 
+        /// Implements @workItemId builtin.
+        /// Result type is always `u32`
+        /// Uses the `pl_op` field, payload is the dimension to get the work item id for.
+        /// Operand is unused and set to Ref.none
+        work_item_id,
+        /// Implements @workGroupSize builtin.
+        /// Result type is always `u32`
+        /// Uses the `pl_op` field, payload is the dimension to get the work group size for.
+        /// Operand is unused and set to Ref.none
+        work_group_size,
+        /// Implements @workGroupId builtin.
+        /// Result type is always `u32`
+        /// Uses the `pl_op` field, payload is the dimension to get the work group id for.
+        /// Operand is unused and set to Ref.none
+        work_group_id,
+
         pub fn fromCmpOp(op: std.math.CompareOperator, optimized: bool) Tag {
             switch (op) {
                 .lt => return if (optimized) .cmp_lt_optimized else .cmp_lt,
@@ -1186,6 +1209,7 @@ pub fn typeOfIndex(air: Air, inst: Air.Inst.Index) Type {
         .ret,
         .ret_load,
         .unreach,
+        .trap,
         => return Type.initTag(.noreturn),
 
         .breakpoint,
@@ -1259,6 +1283,11 @@ pub fn typeOfIndex(air: Air, inst: Air.Inst.Index) Type {
             const err_union_ty = air.typeOf(datas[inst].pl_op.operand);
             return err_union_ty.errorUnionPayload();
         },
+
+        .work_item_id,
+        .work_group_size,
+        .work_group_id,
+        => return Type.u32,
     }
 }
 

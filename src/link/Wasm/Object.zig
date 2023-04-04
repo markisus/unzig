@@ -270,6 +270,7 @@ fn checkLegacyIndirectFunctionTable(object: *Object) !?Symbol {
         .name = table_import.name,
         .tag = .table,
         .index = 0,
+        .virtual_address = undefined,
     };
     table_symbol.setFlag(.WASM_SYM_UNDEFINED);
     table_symbol.setFlag(.WASM_SYM_NO_STRIP);
@@ -600,8 +601,8 @@ fn Parser(comptime ReaderType: type) type {
             });
 
             for (relocations) |*relocation| {
-                const rel_type = try leb.readULEB128(u8, reader);
-                const rel_type_enum = @intToEnum(types.Relocation.RelocationType, rel_type);
+                const rel_type = try reader.readByte();
+                const rel_type_enum = std.meta.intToEnum(types.Relocation.RelocationType, rel_type) catch return error.MalformedSection;
                 relocation.* = .{
                     .relocation_type = rel_type_enum,
                     .offset = try leb.readULEB128(u32, reader),
@@ -673,6 +674,12 @@ fn Parser(comptime ReaderType: type) type {
                             segment.alignment,
                             segment.flags,
                         });
+
+                        // support legacy object files that specified being TLS by the name instead of the TLS flag.
+                        if (!segment.isTLS() and (std.mem.startsWith(u8, segment.name, ".tdata") or std.mem.startsWith(u8, segment.name, ".tbss"))) {
+                            // set the flag so we can simply check for the flag in the rest of the linker.
+                            segment.flags |= @enumToInt(types.Segment.Flags.WASM_SEG_FLAG_TLS);
+                        }
                     }
                     parser.object.segment_info = segments;
                 },
@@ -758,6 +765,7 @@ fn Parser(comptime ReaderType: type) type {
                 .tag = tag,
                 .name = undefined,
                 .index = undefined,
+                .virtual_address = undefined,
             };
 
             switch (tag) {
@@ -844,12 +852,17 @@ fn readEnum(comptime T: type, reader: anytype) !T {
 }
 
 fn readLimits(reader: anytype) !std.wasm.Limits {
-    const flags = try readLeb(u1, reader);
+    const flags = try reader.readByte();
     const min = try readLeb(u32, reader);
-    return std.wasm.Limits{
+    var limits: std.wasm.Limits = .{
+        .flags = flags,
         .min = min,
-        .max = if (flags == 0) null else try readLeb(u32, reader),
+        .max = undefined,
     };
+    if (limits.hasFlag(.WASM_LIMITS_FLAG_HAS_MAX)) {
+        limits.max = try readLeb(u32, reader);
+    }
+    return limits;
 }
 
 fn readInit(reader: anytype) !std.wasm.InitExpression {
@@ -882,7 +895,7 @@ pub fn parseIntoAtoms(object: *Object, gpa: Allocator, object_index: u16, wasm_b
         list.deinit();
     } else symbol_for_segment.deinit();
 
-    for (object.symtable) |symbol, symbol_index| {
+    for (object.symtable, 0..) |symbol, symbol_index| {
         switch (symbol.tag) {
             .function, .data, .section => if (!symbol.isUndefined()) {
                 const gop = try symbol_for_segment.getOrPut(.{ .kind = symbol.tag, .index = symbol.index });
@@ -896,19 +909,14 @@ pub fn parseIntoAtoms(object: *Object, gpa: Allocator, object_index: u16, wasm_b
         }
     }
 
-    for (object.relocatable_data) |relocatable_data, index| {
+    for (object.relocatable_data, 0..) |relocatable_data, index| {
         const final_index = (try wasm_bin.getMatchingSegment(object_index, @intCast(u32, index))) orelse {
             continue; // found unknown section, so skip parsing into atom as we do not know how to handle it.
         };
 
-        const atom = try gpa.create(Atom);
+        const atom_index = @intCast(Atom.Index, wasm_bin.managed_atoms.items.len);
+        const atom = try wasm_bin.managed_atoms.addOne(gpa);
         atom.* = Atom.empty;
-        errdefer {
-            atom.deinit(gpa);
-            gpa.destroy(atom);
-        }
-
-        try wasm_bin.managed_atoms.append(gpa, atom);
         atom.file = object_index;
         atom.size = relocatable_data.size;
         atom.alignment = relocatable_data.getAlignment(object);
@@ -922,11 +930,29 @@ pub fn parseIntoAtoms(object: *Object, gpa: Allocator, object_index: u16, wasm_b
                 reloc.offset -= relocatable_data.offset;
                 try atom.relocs.append(gpa, reloc);
 
-                if (relocation.isTableIndex()) {
-                    try wasm_bin.function_table.put(gpa, .{
-                        .file = object_index,
-                        .index = relocation.index,
-                    }, 0);
+                switch (relocation.relocation_type) {
+                    .R_WASM_TABLE_INDEX_I32,
+                    .R_WASM_TABLE_INDEX_I64,
+                    .R_WASM_TABLE_INDEX_SLEB,
+                    .R_WASM_TABLE_INDEX_SLEB64,
+                    => {
+                        try wasm_bin.function_table.put(gpa, .{
+                            .file = object_index,
+                            .index = relocation.index,
+                        }, 0);
+                    },
+                    .R_WASM_GLOBAL_INDEX_I32,
+                    .R_WASM_GLOBAL_INDEX_LEB,
+                    => {
+                        const sym = object.symtable[relocation.index];
+                        if (sym.tag != .global) {
+                            try wasm_bin.got_symbols.append(
+                                wasm_bin.base.allocator,
+                                .{ .file = object_index, .index = relocation.index },
+                            );
+                        }
+                    },
+                    else => {},
                 }
             }
         }
@@ -938,12 +964,12 @@ pub fn parseIntoAtoms(object: *Object, gpa: Allocator, object_index: u16, wasm_b
             .index = relocatable_data.getIndex(),
         })) |symbols| {
             atom.sym_index = symbols.pop();
-            try wasm_bin.symbol_atom.putNoClobber(gpa, atom.symbolLoc(), atom);
+            try wasm_bin.symbol_atom.putNoClobber(gpa, atom.symbolLoc(), atom_index);
 
             // symbols referencing the same atom will be added as alias
             // or as 'parent' when they are global.
             while (symbols.popOrNull()) |idx| {
-                try wasm_bin.symbol_atom.putNoClobber(gpa, .{ .file = atom.file, .index = idx }, atom);
+                try wasm_bin.symbol_atom.putNoClobber(gpa, .{ .file = atom.file, .index = idx }, atom_index);
                 const alias_symbol = object.symtable[idx];
                 if (alias_symbol.isGlobal()) {
                     atom.sym_index = idx;
@@ -956,7 +982,7 @@ pub fn parseIntoAtoms(object: *Object, gpa: Allocator, object_index: u16, wasm_b
             segment.alignment = std.math.max(segment.alignment, atom.alignment);
         }
 
-        try wasm_bin.appendAtomAtIndex(final_index, atom);
+        try wasm_bin.appendAtomAtIndex(final_index, atom_index);
         log.debug("Parsed into atom: '{s}' at segment index {d}", .{ object.string_table.get(object.symtable[atom.sym_index].name), final_index });
     }
 }

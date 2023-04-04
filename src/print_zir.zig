@@ -179,6 +179,7 @@ const Writer = struct {
             .is_non_null_ptr,
             .is_non_err,
             .is_non_err_ptr,
+            .ret_is_non_err,
             .typeof,
             .struct_init_empty,
             .type_info,
@@ -195,7 +196,6 @@ const Writer = struct {
             .error_name,
             .panic,
             .panic_comptime,
-            .set_cold,
             .set_runtime_safety,
             .sqrt,
             .sin,
@@ -295,6 +295,7 @@ const Writer = struct {
             .add,
             .addwrap,
             .add_sat,
+            .add_unsafe,
             .array_cat,
             .array_mul,
             .mul,
@@ -354,6 +355,8 @@ const Writer = struct {
             .array_type,
             => try self.writePlNodeBin(stream, inst),
 
+            .for_len => try self.writePlNodeMultiOp(stream, inst),
+
             .elem_ptr_imm => try self.writeElemPtrImm(stream, inst),
 
             .@"export" => try self.writePlNodeExport(stream, inst),
@@ -407,6 +410,7 @@ const Writer = struct {
             .alloc_inferred_comptime_mut,
             .ret_ptr,
             .ret_type,
+            .trap,
             => try self.writeNode(stream, inst),
 
             .error_value,
@@ -499,12 +503,18 @@ const Writer = struct {
             .fence,
             .set_float_mode,
             .set_align_stack,
+            .set_cold,
             .wasm_memory_size,
             .error_to_int,
             .int_to_error,
             .reify,
             .c_va_copy,
             .c_va_end,
+            .const_cast,
+            .volatile_cast,
+            .work_item_id,
+            .work_group_size,
+            .work_group_id,
             => {
                 const inst_data = self.code.extraData(Zir.Inst.UnNode, extended.operand).data;
                 const src = LazySrcLoc.nodeOffset(inst_data.node);
@@ -865,6 +875,19 @@ const Writer = struct {
         try self.writeSrc(stream, inst_data.src());
     }
 
+    fn writePlNodeMultiOp(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
+        const inst_data = self.code.instructions.items(.data)[inst].pl_node;
+        const extra = self.code.extraData(Zir.Inst.MultiOp, inst_data.payload_index);
+        const args = self.code.refSlice(extra.end, extra.data.operands_len);
+        try stream.writeAll("{");
+        for (args, 0..) |arg, i| {
+            if (i != 0) try stream.writeAll(", ");
+            try self.writeInstRef(stream, arg);
+        }
+        try stream.writeAll("}) ");
+        try self.writeSrc(stream, inst_data.src());
+    }
+
     fn writeElemPtrImm(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
         const inst_data = self.code.instructions.items(.data)[inst].pl_node;
         const extra = self.code.extraData(Zir.Inst.ElemPtrImm, inst_data.payload_index).data;
@@ -1050,7 +1073,7 @@ const Writer = struct {
         const src = LazySrcLoc.nodeOffset(extra.data.src_node);
         const operands = self.code.refSlice(extra.end, extended.small);
 
-        for (operands) |operand, i| {
+        for (operands, 0..) |operand, i| {
             if (i != 0) try stream.writeAll(", ");
             try self.writeInstRef(stream, operand);
         }
@@ -1374,7 +1397,7 @@ const Writer = struct {
             try stream.writeAll("{\n");
             self.indent += 2;
 
-            for (fields) |field, i| {
+            for (fields, 0..) |field, i| {
                 try self.writeDocComment(stream, field.doc_comment_index);
                 try stream.writeByteNTimes(' ', self.indent);
                 try self.writeFlag(stream, "comptime ", field.is_comptime);
@@ -1941,7 +1964,7 @@ const Writer = struct {
                 try stream.writeByteNTimes(' ', self.indent);
                 if (is_inline) try stream.writeAll("inline ");
 
-                for (items) |item_ref, item_i| {
+                for (items, 0..) |item_ref, item_i| {
                     if (item_i != 0) try stream.writeAll(", ");
                     try self.writeInstRef(stream, item_ref);
                 }
@@ -2257,7 +2280,7 @@ const Writer = struct {
         try self.writeBracedBody(stream, body);
         try stream.writeAll(",[");
         const args = self.code.refSlice(extra.end, extended.small);
-        for (args) |arg, i| {
+        for (args, 0..) |arg, i| {
             if (i != 0) try stream.writeAll(", ");
             try self.writeInstRef(stream, arg);
         }
@@ -2301,8 +2324,9 @@ const Writer = struct {
 
     fn writeBreak(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
         const inst_data = self.code.instructions.items(.data)[inst].@"break";
+        const extra = self.code.extraData(Zir.Inst.Break, inst_data.payload_index).data;
 
-        try self.writeInstIndex(stream, inst_data.block_inst);
+        try self.writeInstIndex(stream, extra.block_inst);
         try stream.writeAll(", ");
         try self.writeInstRef(stream, inst_data.operand);
         try stream.writeAll(")");
@@ -2316,7 +2340,7 @@ const Writer = struct {
 
         try self.writeInstRef(stream, args[0]);
         try stream.writeAll("{");
-        for (args[1..]) |arg, i| {
+        for (args[1..], 0..) |arg, i| {
             if (i != 0) try stream.writeAll(", ");
             try self.writeInstRef(stream, arg);
         }
@@ -2331,7 +2355,7 @@ const Writer = struct {
         const args = self.code.refSlice(extra.end, extra.data.operands_len);
 
         try stream.writeAll("{");
-        for (args) |arg, i| {
+        for (args, 0..) |arg, i| {
             if (i != 0) try stream.writeAll(", ");
             try self.writeInstRef(stream, arg);
         }
@@ -2351,7 +2375,7 @@ const Writer = struct {
         try stream.writeAll(", ");
 
         try stream.writeAll(".{");
-        for (elems) |elem, i| {
+        for (elems, 0..) |elem, i| {
             if (i != 0) try stream.writeAll(", ");
             try self.writeInstRef(stream, elem);
         }

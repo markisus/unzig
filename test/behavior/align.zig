@@ -104,7 +104,18 @@ test "alignment and size of structs with 128-bit fields" {
             .u129_size = 24,
         },
 
-        .x86 => switch (builtin.os.tag) {
+        .x86 => if (builtin.object_format == .c) .{
+            .a_align = 16,
+            .a_size = 16,
+
+            .b_align = 16,
+            .b_size = 32,
+
+            .u128_align = 16,
+            .u128_size = 16,
+            .u129_align = 16,
+            .u129_size = 32,
+        } else switch (builtin.os.tag) {
             .windows => .{
                 .a_align = 8,
                 .a_size = 16,
@@ -260,7 +271,6 @@ fn sliceExpects4(slice: []align(4) u32) void {
 
 test "return error union with 128-bit integer" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -466,7 +476,6 @@ const DefaultAligned = struct {
 
 test "read 128-bit field from default aligned struct in stack memory" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -483,7 +492,6 @@ var default_aligned_global = DefaultAligned{
 };
 
 test "read 128-bit field from default aligned struct in global memory" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -541,6 +549,11 @@ test "align(N) on functions" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
+    // This is not supported on MSVC
+    if (builtin.zig_backend == .stage2_c and builtin.os.tag == .windows) {
+        return error.SkipZigTest;
+    }
+
     // function alignment is a compile error on wasm32/wasm64
     if (native_arch == .wasm32 or native_arch == .wasm64) return error.SkipZigTest;
     if (native_arch == .thumb) return error.SkipZigTest;
@@ -552,7 +565,6 @@ fn overaligned_fn() align(0x1000) i32 {
 }
 
 test "comptime alloc alignment" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO

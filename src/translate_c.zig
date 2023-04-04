@@ -784,9 +784,9 @@ fn visitVarDecl(c: *Context, var_decl: *const clang.VarDecl, mangled_name: ?[]co
 
     const qual_type = var_decl.getTypeSourceInfo_getType();
     const storage_class = var_decl.getStorageClass();
-    const is_const = qual_type.isConstQualified();
     const has_init = var_decl.hasInit();
     const decl_init = var_decl.getInit();
+    var is_const = qual_type.isConstQualified();
 
     // In C extern variables with initializers behave like Zig exports.
     // extern int foo = 2;
@@ -843,6 +843,20 @@ fn visitVarDecl(c: *Context, var_decl: *const clang.VarDecl, mangled_name: ?[]co
 
         // std.mem.zeroes(T)
         init_node = try Tag.std_mem_zeroes.create(c.arena, type_node);
+    } else if (qual_type.getTypeClass() == .IncompleteArray) {
+        // Oh no, an extern array of unknown size! These are really fun because there's no
+        // direct equivalent in Zig. To translate correctly, we'll have to create a C-pointer
+        // to the data initialized via @extern.
+
+        const name_str = try std.fmt.allocPrint(c.arena, "\"{s}\"", .{var_name});
+        init_node = try Tag.builtin_extern.create(c.arena, .{
+            .type = type_node,
+            .name = try Tag.string_literal.create(c.arena, name_str),
+        });
+
+        // Since this is really a pointer to the underlying data, we tweak a few properties.
+        is_extern = false;
+        is_const = true;
     }
 
     const linksection_string = blk: {
@@ -1423,7 +1437,7 @@ fn transConvertVectorExpr(
     }
 
     const init_list = try c.arena.alloc(Node, num_elements);
-    for (init_list) |*init, init_index| {
+    for (init_list, 0..) |*init, init_index| {
         const tmp_decl = block_scope.statements.items[init_index];
         const name = tmp_decl.castTag(.var_simple).?.data.name;
         init.* = try Tag.identifier.create(c.arena, name);
@@ -1454,7 +1468,7 @@ fn makeShuffleMask(c: *Context, scope: *Scope, expr: *const clang.ShuffleVectorE
 
     const init_list = try c.arena.alloc(Node, mask_len);
 
-    for (init_list) |*init, i| {
+    for (init_list, 0..) |*init, i| {
         const index_expr = try transExprCoercing(c, scope, expr.getExpr(@intCast(c_uint, i + 2)), .used);
         const converted_index = try Tag.helpers_shuffle_vector_index.create(c.arena, .{ .lhs = index_expr, .rhs = vector_len });
         init.* = converted_index;
@@ -1748,7 +1762,8 @@ fn transBinaryOperator(
         const lhs_expr = stmt.getLHS();
         const lhs_qt = getExprQualType(c, lhs_expr);
         const lhs_qt_translated = try transQualType(c, scope, lhs_qt, lhs_expr.getBeginLoc());
-        const elem_type = lhs_qt_translated.castTag(.c_pointer).?.data.elem_type;
+        const c_pointer = getContainer(c, lhs_qt_translated).?;
+        const elem_type = c_pointer.castTag(.c_pointer).?.data.elem_type;
         const sizeof = try Tag.sizeof.create(c.arena, elem_type);
 
         const bitcast = try Tag.bit_cast.create(c.arena, .{ .lhs = ptrdiff_type, .rhs = infixOpNode });
@@ -2685,7 +2700,7 @@ fn transInitListExprArray(
     const init_node = if (init_count != 0) blk: {
         const init_list = try c.arena.alloc(Node, init_count);
 
-        for (init_list) |*init, i| {
+        for (init_list, 0..) |*init, i| {
             const elem_expr = expr.getInit(@intCast(c_uint, i));
             init.* = try transExprCoercing(c, scope, elem_expr, .used);
         }
@@ -2759,7 +2774,7 @@ fn transInitListExprVector(
     }
 
     const init_list = try c.arena.alloc(Node, num_elements);
-    for (init_list) |*init, init_index| {
+    for (init_list, 0..) |*init, init_index| {
         if (init_index < init_count) {
             const tmp_decl = block_scope.statements.items[init_index];
             const name = tmp_decl.castTag(.var_simple).?.data.name;
@@ -4519,7 +4534,10 @@ fn transCreateNodeAssign(
     defer block_scope.deinit();
 
     const tmp = try block_scope.makeMangledName(c, "tmp");
-    const rhs_node = try transExpr(c, &block_scope.base, rhs, .used);
+    var rhs_node = try transExpr(c, &block_scope.base, rhs, .used);
+    if (!exprIsBooleanType(lhs) and isBoolRes(rhs_node)) {
+        rhs_node = try Tag.bool_to_int.create(c.arena, rhs_node);
+    }
     const tmp_decl = try Tag.var_simple.create(c.arena, .{ .name = tmp, .init = rhs_node });
     try block_scope.statements.append(tmp_decl);
 
@@ -4645,7 +4663,7 @@ fn transCreateNodeMacroFn(c: *Context, name: []const u8, ref: Node, proto_alias:
 
     const unwrap_expr = try Tag.unwrap.create(c.arena, init);
     const args = try c.arena.alloc(Node, fn_params.items.len);
-    for (fn_params.items) |param, i| {
+    for (fn_params.items, 0..) |param, i| {
         args[i] = try Tag.identifier.create(c.arena, param.name.?);
     }
     const call_expr = try Tag.call.create(c.arena, .{
@@ -5289,7 +5307,7 @@ const PatternList = struct {
 
     fn init(allocator: mem.Allocator) Error!PatternList {
         const patterns = try allocator.alloc(Pattern, templates.len);
-        for (templates) |template, i| {
+        for (templates, 0..) |template, i| {
             try patterns[i].init(allocator, template);
         }
         return PatternList{ .patterns = patterns };
@@ -5774,7 +5792,7 @@ fn parseCNumLit(c: *Context, m: *MacroCtx) ParseError!Node {
 
 fn zigifyEscapeSequences(ctx: *Context, m: *MacroCtx) ![]const u8 {
     var source = m.slice();
-    for (source) |c, i| {
+    for (source, 0..) |c, i| {
         if (c == '\"' or c == '\'') {
             source = source[i..];
             break;

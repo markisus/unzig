@@ -43,6 +43,8 @@ pub fn suggestVectorSizeForCpu(comptime T: type, comptime cpu: std.Target.Cpu) ?
             //       for multiple processing, but I don't know what's optimal here, if using
             //       the 2048 bits or using just 64 per vector or something in between
             if (std.Target.sparc.featureSetHasAny(cpu.features, .{ .vis, .vis2, .vis3 })) break :blk 64;
+        } else if (cpu.arch.isWasm()) {
+            if (std.Target.wasm.featureSetHas(cpu.features, .simd128)) break :blk 128;
         }
         return null;
     };
@@ -86,16 +88,18 @@ pub fn VectorCount(comptime VectorType: type) type {
 
 /// Returns a vector containing the first `len` integers in order from 0 to `len`-1.
 /// For example, `iota(i32, 8)` will return a vector containing `.{0, 1, 2, 3, 4, 5, 6, 7}`.
-pub fn iota(comptime T: type, comptime len: usize) @Vector(len, T) {
-    var out: [len]T = undefined;
-    for (out) |*element, i| {
-        element.* = switch (@typeInfo(T)) {
-            .Int => @intCast(T, i),
-            .Float => @intToFloat(T, i),
-            else => @compileError("Can't use type " ++ @typeName(T) ++ " in iota."),
-        };
+pub inline fn iota(comptime T: type, comptime len: usize) @Vector(len, T) {
+    comptime {
+        var out: [len]T = undefined;
+        for (&out, 0..) |*element, i| {
+            element.* = switch (@typeInfo(T)) {
+                .Int => @intCast(T, i),
+                .Float => @intToFloat(T, i),
+                else => @compileError("Can't use type " ++ @typeName(T) ++ " in iota."),
+            };
+        }
+        return @as(@Vector(len, T), out);
     }
-    return @as(@Vector(len, T), out);
 }
 
 /// Returns a vector containing the same elements as the input, but repeated until the desired length is reached.

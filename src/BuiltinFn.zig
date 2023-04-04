@@ -28,6 +28,7 @@ pub const Tag = enum {
     cmpxchg_weak,
     compile_error,
     compile_log,
+    const_cast,
     ctz,
     c_undef,
     c_va_arg,
@@ -108,6 +109,7 @@ pub const Tag = enum {
     sub_with_overflow,
     tag_name,
     This,
+    trap,
     truncate,
     Type,
     type_info,
@@ -115,6 +117,10 @@ pub const Tag = enum {
     TypeOf,
     union_init,
     Vector,
+    volatile_cast,
+    work_item_id,
+    work_group_size,
+    work_group_id,
 };
 
 pub const MemLocRequirement = enum {
@@ -342,6 +348,13 @@ pub const list = list: {
             .{
                 .tag = .compile_log,
                 .param_count = null,
+            },
+        },
+        .{
+            "@constCast",
+            .{
+                .tag = .const_cast,
+                .param_count = 1,
             },
         },
         .{
@@ -907,6 +920,13 @@ pub const list = list: {
             },
         },
         .{
+            "@trap",
+            .{
+                .tag = .trap,
+                .param_count = 0,
+            },
+        },
+        .{
             "@truncate",
             .{
                 .tag = .truncate,
@@ -954,6 +974,33 @@ pub const list = list: {
             .{
                 .tag = .Vector,
                 .param_count = 2,
+            },
+        },
+        .{
+            "@volatileCast",
+            .{
+                .tag = .volatile_cast,
+                .param_count = 1,
+            },
+        },
+        .{
+            "@workItemId", .{
+                .tag = .work_item_id,
+                .param_count = 1,
+            },
+        },
+        .{
+            "@workGroupSize",
+            .{
+                .tag = .work_group_size,
+                .param_count = 1,
+            },
+        },
+        .{
+            "@workGroupId",
+            .{
+                .tag = .work_group_id,
+                .param_count = 1,
             },
         },
     });

@@ -85,6 +85,9 @@ pub const Context = opaque {
 
     pub const createBuilder = LLVMCreateBuilderInContext;
     extern fn LLVMCreateBuilderInContext(C: *Context) *Builder;
+
+    pub const setOptBisectLimit = ZigLLVMSetOptBisectLimit;
+    extern fn ZigLLVMSetOptBisectLimit(C: *Context, limit: c_int) void;
 };
 
 pub const Value = opaque {
@@ -251,9 +254,6 @@ pub const Value = opaque {
     pub const addFunctionAttr = ZigLLVMAddFunctionAttr;
     extern fn ZigLLVMAddFunctionAttr(Fn: *Value, attr_name: [*:0]const u8, attr_value: [*:0]const u8) void;
 
-    pub const getGEPResultElementType = ZigLLVMGetGEPResultElementType;
-    extern fn ZigLLVMGetGEPResultElementType(GEP: *Value) *Type;
-
     pub const addByValAttr = ZigLLVMAddByValAttr;
     extern fn ZigLLVMAddByValAttr(Fn: *Value, ArgNo: c_uint, type: *Type) void;
 };
@@ -419,6 +419,9 @@ pub const Module = opaque {
 
     pub const printModuleToFile = LLVMPrintModuleToFile;
     extern fn LLVMPrintModuleToFile(M: *Module, Filename: [*:0]const u8, ErrorMessage: *[*:0]const u8) Bool;
+
+    pub const writeBitcodeToFile = LLVMWriteBitcodeToFile;
+    extern fn LLVMWriteBitcodeToFile(M: *Module, Path: [*:0]const u8) c_int;
 };
 
 pub const lookupIntrinsicID = LLVMLookupIntrinsicID;
@@ -1527,8 +1530,12 @@ pub const address_space = struct {
 
     // See llvm/lib/Target/AVR/AVR.h
     pub const avr = struct {
-        pub const data_memory: c_uint = 0;
-        pub const program_memory: c_uint = 1;
+        pub const flash: c_uint = 1;
+        pub const flash1: c_uint = 2;
+        pub const flash2: c_uint = 3;
+        pub const flash3: c_uint = 4;
+        pub const flash4: c_uint = 5;
+        pub const flash5: c_uint = 6;
     };
 
     // See llvm/lib/Target/NVPTX/NVPTX.h

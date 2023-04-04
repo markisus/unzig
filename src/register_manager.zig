@@ -19,6 +19,9 @@ pub const AllocateRegistersError = error{
     /// Can happen when spilling an instruction in codegen runs out of
     /// memory, so we propagate that error
     OutOfMemory,
+    /// Can happen when spilling an instruction in codegen triggers integer
+    /// overflow, so we propagate that error
+    Overflow,
     /// Can happen when spilling an instruction triggers a codegen
     /// error, so we propagate that error
     CodegenFail,
@@ -82,7 +85,7 @@ pub fn RegisterManager(
             comptime registers: []const Register,
             reg: Register,
         ) ?std.math.IntFittingRange(0, registers.len - 1) {
-            inline for (tracked_registers) |cpreg, i| {
+            inline for (tracked_registers, 0..) |cpreg, i| {
                 if (reg.id() == cpreg.id()) return i;
             }
             return null;
@@ -146,17 +149,26 @@ pub fn RegisterManager(
             return RegisterLock{ .register = reg };
         }
 
+        /// Like `lockReg` but locks multiple registers.
+        pub fn lockRegs(
+            self: *Self,
+            comptime count: comptime_int,
+            regs: [count]Register,
+        ) [count]?RegisterLock {
+            var results: [count]?RegisterLock = undefined;
+            for (&results, regs) |*result, reg| result.* = self.lockReg(reg);
+            return results;
+        }
+
         /// Like `lockRegAssumeUnused` but locks multiple registers.
         pub fn lockRegsAssumeUnused(
             self: *Self,
             comptime count: comptime_int,
             regs: [count]Register,
         ) [count]RegisterLock {
-            var buf: [count]RegisterLock = undefined;
-            for (regs) |reg, i| {
-                buf[i] = self.lockRegAssumeUnused(reg);
-            }
-            return buf;
+            var results: [count]RegisterLock = undefined;
+            for (&results, regs) |*result, reg| result.* = self.lockRegAssumeUnused(reg);
+            return results;
         }
 
         /// Unlocks the register allowing its re-allocation and re-use.
@@ -207,13 +219,14 @@ pub fn RegisterManager(
             }
             assert(i == count);
 
-            for (regs) |reg, j| {
+            for (regs, insts) |reg, inst| {
+                log.debug("tryAllocReg {} for inst {?}", .{ reg, inst });
                 self.markRegAllocated(reg);
 
-                if (insts[j]) |inst| {
+                if (inst) |tracked_inst| {
                     // Track the register
                     const index = indexOfRegIntoTracked(reg).?; // indexOfReg() on a callee-preserved reg should never return null
-                    self.registers[index] = inst;
+                    self.registers[index] = tracked_inst;
                     self.markRegUsed(reg);
                 }
             }
@@ -255,6 +268,7 @@ pub fn RegisterManager(
                     if (excludeRegister(reg, register_class)) break;
                     if (self.isRegLocked(reg)) continue;
 
+                    log.debug("allocReg {} for inst {?}", .{ reg, insts[i] });
                     regs[i] = reg;
                     self.markRegAllocated(reg);
                     const index = indexOfRegIntoTracked(reg).?; // indexOfReg() on a callee-preserved reg should never return null
@@ -302,40 +316,32 @@ pub fn RegisterManager(
         pub fn getReg(self: *Self, reg: Register, inst: ?Air.Inst.Index) AllocateRegistersError!void {
             const index = indexOfRegIntoTracked(reg) orelse return;
             log.debug("getReg {} for inst {?}", .{ reg, inst });
-            self.markRegAllocated(reg);
 
-            if (inst) |tracked_inst|
-                if (!self.isRegFree(reg)) {
-                    // Move the instruction that was previously there to a
-                    // stack allocation.
-                    const spilled_inst = self.registers[index];
-                    self.registers[index] = tracked_inst;
-                    try self.getFunction().spillInstruction(reg, spilled_inst);
-                } else {
-                    self.getRegAssumeFree(reg, tracked_inst);
-                }
-            else {
-                if (!self.isRegFree(reg)) {
-                    // Move the instruction that was previously there to a
-                    // stack allocation.
-                    const spilled_inst = self.registers[index];
-                    try self.getFunction().spillInstruction(reg, spilled_inst);
-                    self.freeReg(reg);
-                }
-            }
+            if (!self.isRegFree(reg)) {
+                self.markRegAllocated(reg);
+
+                // Move the instruction that was previously there to a
+                // stack allocation.
+                const spilled_inst = self.registers[index];
+                if (inst) |tracked_inst| self.registers[index] = tracked_inst;
+                try self.getFunction().spillInstruction(reg, spilled_inst);
+                if (inst == null) self.freeReg(reg);
+            } else self.getRegAssumeFree(reg, inst);
         }
 
         /// Allocates the specified register with the specified
         /// instruction. Asserts that the register is free and no
         /// spilling is necessary.
-        pub fn getRegAssumeFree(self: *Self, reg: Register, inst: Air.Inst.Index) void {
+        pub fn getRegAssumeFree(self: *Self, reg: Register, inst: ?Air.Inst.Index) void {
             const index = indexOfRegIntoTracked(reg) orelse return;
-            log.debug("getRegAssumeFree {} for inst {}", .{ reg, inst });
+            log.debug("getRegAssumeFree {} for inst {?}", .{ reg, inst });
             self.markRegAllocated(reg);
 
             assert(self.isRegFree(reg));
-            self.registers[index] = inst;
-            self.markRegUsed(reg);
+            if (inst) |tracked_inst| {
+                self.registers[index] = tracked_inst;
+                self.markRegUsed(reg);
+            }
         }
 
         /// Marks the specified register as free

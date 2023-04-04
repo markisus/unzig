@@ -169,7 +169,7 @@ test "Allocator.resize" {
         var values = try testing.allocator.alloc(T, 100);
         defer testing.allocator.free(values);
 
-        for (values) |*v, i| v.* = @intCast(T, i);
+        for (values, 0..) |*v, i| v.* = @intCast(T, i);
         if (!testing.allocator.resize(values, values.len + 10)) return error.OutOfMemory;
         values = values.ptr[0 .. values.len + 10];
         try testing.expect(values.len == 110);
@@ -185,7 +185,7 @@ test "Allocator.resize" {
         var values = try testing.allocator.alloc(T, 100);
         defer testing.allocator.free(values);
 
-        for (values) |*v, i| v.* = @intToFloat(T, i);
+        for (values, 0..) |*v, i| v.* = @intToFloat(T, i);
         if (!testing.allocator.resize(values, values.len + 10)) return error.OutOfMemory;
         values = values.ptr[0 .. values.len + 10];
         try testing.expect(values.len == 110);
@@ -196,13 +196,8 @@ test "Allocator.resize" {
 /// dest.len must be >= source.len.
 /// If the slices overlap, dest.ptr must be <= src.ptr.
 pub fn copy(comptime T: type, dest: []T, source: []const T) void {
-    // TODO instead of manually doing this check for the whole array
-    // and turning off runtime safety, the compiler should detect loops like
-    // this and automatically omit safety checks for loops
-    @setRuntimeSafety(false);
-    assert(dest.len >= source.len);
-    for (source) |s, i|
-        dest[i] = s;
+    for (dest[0..source.len], source) |*d, s|
+        d.* = s;
 }
 
 /// Copy all of source into dest at position 0.
@@ -431,34 +426,48 @@ pub fn zeroInit(comptime T: type, init: anytype) T {
         .Struct => |struct_info| {
             switch (@typeInfo(Init)) {
                 .Struct => |init_info| {
-                    var value = std.mem.zeroes(T);
+                    if (init_info.is_tuple) {
+                        if (init_info.fields.len > struct_info.fields.len) {
+                            @compileError("Tuple initializer has more elments than there are fields in `" ++ @typeName(T) ++ "`");
+                        }
+                    } else {
+                        inline for (init_info.fields) |field| {
+                            if (!@hasField(T, field.name)) {
+                                @compileError("Encountered an initializer for `" ++ field.name ++ "`, but it is not a field of " ++ @typeName(T));
+                            }
+                        }
+                    }
 
-                    inline for (struct_info.fields) |field| {
-                        if (field.default_value) |default_value_ptr| {
+                    var value: T = undefined;
+
+                    inline for (struct_info.fields, 0..) |field, i| {
+                        if (field.is_comptime) {
+                            continue;
+                        }
+
+                        if (init_info.is_tuple and init_info.fields.len > i) {
+                            @field(value, field.name) = @field(init, init_info.fields[i].name);
+                        } else if (@hasField(@TypeOf(init), field.name)) {
+                            switch (@typeInfo(field.type)) {
+                                .Struct => {
+                                    @field(value, field.name) = zeroInit(field.type, @field(init, field.name));
+                                },
+                                else => {
+                                    @field(value, field.name) = @field(init, field.name);
+                                },
+                            }
+                        } else if (field.default_value) |default_value_ptr| {
                             const default_value = @ptrCast(*align(1) const field.type, default_value_ptr).*;
                             @field(value, field.name) = default_value;
-                        }
-                    }
-
-                    if (init_info.is_tuple) {
-                        inline for (init_info.fields) |field, i| {
-                            @field(value, struct_info.fields[i].name) = @field(init, field.name);
-                        }
-                        return value;
-                    }
-
-                    inline for (init_info.fields) |field| {
-                        if (!@hasField(T, field.name)) {
-                            @compileError("Encountered an initializer for `" ++ field.name ++ "`, but it is not a field of " ++ @typeName(T));
-                        }
-
-                        switch (@typeInfo(field.type)) {
-                            .Struct => {
-                                @field(value, field.name) = zeroInit(field.type, @field(init, field.name));
-                            },
-                            else => {
-                                @field(value, field.name) = @field(init, field.name);
-                            },
+                        } else {
+                            switch (@typeInfo(field.type)) {
+                                .Struct => {
+                                    @field(value, field.name) = std.mem.zeroInit(field.type, .{});
+                                },
+                                else => {
+                                    @field(value, field.name) = std.mem.zeroes(@TypeOf(@field(value, field.name)));
+                                },
+                            }
                         }
                     }
 
@@ -538,6 +547,24 @@ test "zeroInit" {
         .foo = 69,
         .bar = 420,
     }, b);
+
+    const Baz = struct {
+        foo: [:0]const u8 = "bar",
+    };
+
+    const baz1 = zeroInit(Baz, .{});
+    try testing.expectEqual(Baz{}, baz1);
+
+    const baz2 = zeroInit(Baz, .{ .foo = "zab" });
+    try testing.expectEqualSlices(u8, "zab", baz2.foo);
+
+    const NestedBaz = struct {
+        bbb: Baz,
+    };
+    const nested_baz = zeroInit(NestedBaz, .{});
+    try testing.expectEqual(NestedBaz{
+        .bbb = Baz{},
+    }, nested_baz);
 }
 
 /// Compares two slices of numbers lexicographically. O(n).
@@ -579,8 +606,8 @@ test "lessThan" {
 pub fn eql(comptime T: type, a: []const T, b: []const T) bool {
     if (a.len != b.len) return false;
     if (a.ptr == b.ptr) return true;
-    for (a) |item, index| {
-        if (b[index] != item) return false;
+    for (a, b) |a_elem, b_elem| {
+        if (a_elem != b_elem) return false;
     }
     return true;
 }
@@ -604,12 +631,9 @@ test "indexOfDiff" {
     try testing.expectEqual(indexOfDiff(u8, "xne", "one"), 0);
 }
 
-/// Takes a pointer to an array, a sentinel-terminated pointer, or a slice, and
-/// returns a slice. If there is a sentinel on the input type, there will be a
-/// sentinel on the output type. The constness of the output type matches
-/// the constness of the input type. `[*c]` pointers are assumed to be 0-terminated,
-/// and assumed to not allow null.
-pub fn Span(comptime T: type) type {
+/// Takes a sentinel-terminated pointer and returns a slice preserving pointer attributes.
+/// `[*c]` pointers are assumed to be 0-terminated and assumed to not be allowzero.
+fn Span(comptime T: type) type {
     switch (@typeInfo(T)) {
         .Optional => |optional_info| {
             return ?Span(optional_info.child);
@@ -617,39 +641,22 @@ pub fn Span(comptime T: type) type {
         .Pointer => |ptr_info| {
             var new_ptr_info = ptr_info;
             switch (ptr_info.size) {
-                .One => switch (@typeInfo(ptr_info.child)) {
-                    .Array => |info| {
-                        new_ptr_info.child = info.child;
-                        new_ptr_info.sentinel = info.sentinel;
-                    },
-                    else => @compileError("invalid type given to std.mem.Span"),
-                },
                 .C => {
                     new_ptr_info.sentinel = &@as(ptr_info.child, 0);
                     new_ptr_info.is_allowzero = false;
                 },
-                .Many, .Slice => {},
+                .Many => if (ptr_info.sentinel == null) @compileError("invalid type given to std.mem.span: " ++ @typeName(T)),
+                .One, .Slice => @compileError("invalid type given to std.mem.span: " ++ @typeName(T)),
             }
             new_ptr_info.size = .Slice;
             return @Type(.{ .Pointer = new_ptr_info });
         },
-        else => @compileError("invalid type given to std.mem.Span"),
+        else => {},
     }
+    @compileError("invalid type given to std.mem.span: " ++ @typeName(T));
 }
 
 test "Span" {
-    try testing.expect(Span(*[5]u16) == []u16);
-    try testing.expect(Span(?*[5]u16) == ?[]u16);
-    try testing.expect(Span(*const [5]u16) == []const u16);
-    try testing.expect(Span(?*const [5]u16) == ?[]const u16);
-    try testing.expect(Span([]u16) == []u16);
-    try testing.expect(Span(?[]u16) == ?[]u16);
-    try testing.expect(Span([]const u8) == []const u8);
-    try testing.expect(Span(?[]const u8) == ?[]const u8);
-    try testing.expect(Span([:1]u16) == [:1]u16);
-    try testing.expect(Span(?[:1]u16) == ?[:1]u16);
-    try testing.expect(Span([:1]const u8) == [:1]const u8);
-    try testing.expect(Span(?[:1]const u8) == ?[:1]const u8);
     try testing.expect(Span([*:1]u16) == [:1]u16);
     try testing.expect(Span(?[*:1]u16) == ?[:1]u16);
     try testing.expect(Span([*:1]const u8) == [:1]const u8);
@@ -660,13 +667,10 @@ test "Span" {
     try testing.expect(Span(?[*c]const u8) == ?[:0]const u8);
 }
 
-/// Takes a pointer to an array, a sentinel-terminated pointer, or a slice, and
-/// returns a slice. If there is a sentinel on the input type, there will be a
-/// sentinel on the output type. The constness of the output type matches
-/// the constness of the input type.
-///
-/// When there is both a sentinel and an array length or slice length, the
-/// length value is used instead of the sentinel.
+/// Takes a sentinel-terminated pointer and returns a slice, iterating over the
+/// memory to find the sentinel and determine the length.
+/// Ponter attributes such as const are preserved.
+/// `[*c]` pointers are assumed to be non-null and 0-terminated.
 pub fn span(ptr: anytype) Span(@TypeOf(ptr)) {
     if (@typeInfo(@TypeOf(ptr)) == .Optional) {
         if (ptr) |non_null| {
@@ -690,7 +694,6 @@ test "span" {
     var array: [5]u16 = [_]u16{ 1, 2, 3, 4, 5 };
     const ptr = @as([*:3]u16, array[0..2 :3]);
     try testing.expect(eql(u16, span(ptr), &[_]u16{ 1, 2 }));
-    try testing.expect(eql(u16, span(&array), &[_]u16{ 1, 2, 3, 4, 5 }));
     try testing.expectEqual(@as(?[:0]u16, null), span(@as(?[*:0]u16, null)));
 }
 
@@ -887,22 +890,15 @@ test "lenSliceTo" {
     }
 }
 
-/// Takes a pointer to an array, an array, a vector, a sentinel-terminated pointer,
-/// a slice or a tuple, and returns the length.
-/// In the case of a sentinel-terminated array, it uses the array length.
-/// For C pointers it assumes it is a pointer-to-many with a 0 sentinel.
+/// Takes a sentinel-terminated pointer and iterates over the memory to find the
+/// sentinel and determine the length.
+/// `[*c]` pointers are assumed to be non-null and 0-terminated.
 pub fn len(value: anytype) usize {
-    return switch (@typeInfo(@TypeOf(value))) {
-        .Array => |info| info.len,
-        .Vector => |info| info.len,
+    switch (@typeInfo(@TypeOf(value))) {
         .Pointer => |info| switch (info.size) {
-            .One => switch (@typeInfo(info.child)) {
-                .Array => value.len,
-                else => @compileError("invalid type given to std.mem.len"),
-            },
             .Many => {
                 const sentinel_ptr = info.sentinel orelse
-                    @compileError("length of pointer with no sentinel");
+                    @compileError("invalid type given to std.mem.len: " ++ @typeName(@TypeOf(value)));
                 const sentinel = @ptrCast(*align(1) const info.child, sentinel_ptr).*;
                 return indexOfSentinel(info.child, sentinel, value);
             },
@@ -910,41 +906,18 @@ pub fn len(value: anytype) usize {
                 assert(value != null);
                 return indexOfSentinel(info.child, 0, value);
             },
-            .Slice => value.len,
+            else => @compileError("invalid type given to std.mem.len: " ++ @typeName(@TypeOf(value))),
         },
-        .Struct => |info| if (info.is_tuple) {
-            return info.fields.len;
-        } else @compileError("invalid type given to std.mem.len"),
-        else => @compileError("invalid type given to std.mem.len"),
-    };
+        else => @compileError("invalid type given to std.mem.len: " ++ @typeName(@TypeOf(value))),
+    }
 }
 
 test "len" {
-    try testing.expect(len("aoeu") == 4);
-
-    {
-        var array: [5]u16 = [_]u16{ 1, 2, 3, 4, 5 };
-        try testing.expect(len(&array) == 5);
-        try testing.expect(len(array[0..3]) == 3);
-        array[2] = 0;
-        const ptr = @as([*:0]u16, array[0..2 :0]);
-        try testing.expect(len(ptr) == 2);
-    }
-    {
-        var array: [5:0]u16 = [_:0]u16{ 1, 2, 3, 4, 5 };
-        try testing.expect(len(&array) == 5);
-        array[2] = 0;
-        try testing.expect(len(&array) == 5);
-    }
-    {
-        const vector: meta.Vector(2, u32) = [2]u32{ 1, 2 };
-        try testing.expect(len(vector) == 2);
-    }
-    {
-        const tuple = .{ 1, 2 };
-        try testing.expect(len(tuple) == 2);
-        try testing.expect(tuple[0] == 1);
-    }
+    var array: [5]u16 = [_]u16{ 1, 2, 0, 4, 5 };
+    const ptr = @as([*:4]u16, array[0..3 :4]);
+    try testing.expect(len(ptr) == 3);
+    const c_ptr = @as([*c]u16, ptr);
+    try testing.expect(len(c_ptr) == 2);
 }
 
 pub fn indexOfSentinel(comptime Elem: type, comptime sentinel: Elem, ptr: [*:sentinel]const Elem) usize {
@@ -963,21 +936,21 @@ pub fn allEqual(comptime T: type, slice: []const T, scalar: T) bool {
     return true;
 }
 
-/// Remove values from the beginning of a slice.
+/// Remove a set of values from the beginning of a slice.
 pub fn trimLeft(comptime T: type, slice: []const T, values_to_strip: []const T) []const T {
     var begin: usize = 0;
     while (begin < slice.len and indexOfScalar(T, values_to_strip, slice[begin]) != null) : (begin += 1) {}
     return slice[begin..];
 }
 
-/// Remove values from the end of a slice.
+/// Remove a set of values from the end of a slice.
 pub fn trimRight(comptime T: type, slice: []const T, values_to_strip: []const T) []const T {
     var end: usize = slice.len;
     while (end > 0 and indexOfScalar(T, values_to_strip, slice[end - 1]) != null) : (end -= 1) {}
     return slice[0..end];
 }
 
-/// Remove values from the beginning and end of a slice.
+/// Remove a set of values from the beginning and end of a slice.
 pub fn trim(comptime T: type, slice: []const T, values_to_strip: []const T) []const T {
     var begin: usize = 0;
     var end: usize = slice.len;
@@ -1283,7 +1256,7 @@ pub fn readVarInt(comptime ReturnType: type, bytes: []const u8, endian: Endian) 
         },
         .Little => {
             const ShiftType = math.Log2Int(ReturnType);
-            for (bytes) |b, index| {
+            for (bytes, 0..) |b, index| {
                 result = result | (@as(ReturnType, b) << @intCast(ShiftType, index * 8));
             }
         },
@@ -1350,7 +1323,7 @@ pub fn readVarPackedInt(
         },
         .Little => {
             int = read_bytes[0] >> bit_shift;
-            for (read_bytes[1..]) |elem, i| {
+            for (read_bytes[1..], 0..) |elem, i| {
                 int |= (@as(uN, elem) << @intCast(Log2N, (8 * (i + 1) - bit_shift)));
             }
         },
@@ -2929,7 +2902,7 @@ pub fn indexOfMin(comptime T: type, slice: []const T) usize {
     assert(slice.len > 0);
     var best = slice[0];
     var index: usize = 0;
-    for (slice[1..]) |item, i| {
+    for (slice[1..], 0..) |item, i| {
         if (item < best) {
             best = item;
             index = i + 1;
@@ -2950,7 +2923,7 @@ pub fn indexOfMax(comptime T: type, slice: []const T) usize {
     assert(slice.len > 0);
     var best = slice[0];
     var index: usize = 0;
-    for (slice[1..]) |item, i| {
+    for (slice[1..], 0..) |item, i| {
         if (item > best) {
             best = item;
             index = i + 1;
@@ -2974,7 +2947,7 @@ pub fn indexOfMinMax(comptime T: type, slice: []const T) struct { index_min: usi
     var maxVal = slice[0];
     var minIdx: usize = 0;
     var maxIdx: usize = 0;
-    for (slice[1..]) |item, i| {
+    for (slice[1..], 0..) |item, i| {
         if (item < minVal) {
             minVal = item;
             minIdx = i + 1;
@@ -3016,52 +2989,107 @@ test "reverse" {
 }
 
 fn ReverseIterator(comptime T: type) type {
-    const info: struct { Child: type, Pointer: type } = blk: {
+    const Pointer = blk: {
         switch (@typeInfo(T)) {
-            .Pointer => |info| switch (info.size) {
-                .Slice => break :blk .{
-                    .Child = info.child,
-                    .Pointer = @Type(.{ .Pointer = .{
-                        .size = .Many,
-                        .is_const = info.is_const,
-                        .is_volatile = info.is_volatile,
-                        .alignment = info.alignment,
-                        .address_space = info.address_space,
-                        .child = info.child,
-                        .is_allowzero = info.is_allowzero,
-                        .sentinel = info.sentinel,
-                    } }),
+            .Pointer => |ptr_info| switch (ptr_info.size) {
+                .One => switch (@typeInfo(ptr_info.child)) {
+                    .Array => |array_info| {
+                        var new_ptr_info = ptr_info;
+                        new_ptr_info.size = .Many;
+                        new_ptr_info.child = array_info.child;
+                        new_ptr_info.sentinel = array_info.sentinel;
+                        break :blk @Type(.{ .Pointer = new_ptr_info });
+                    },
+                    else => {},
+                },
+                .Slice => {
+                    var new_ptr_info = ptr_info;
+                    new_ptr_info.size = .Many;
+                    break :blk @Type(.{ .Pointer = new_ptr_info });
                 },
                 else => {},
             },
             else => {},
         }
-        @compileError("reverse iterator expects slice, found " ++ @typeName(T));
+        @compileError("expected slice or pointer to array, found '" ++ @typeName(T) ++ "'");
     };
+    const Element = std.meta.Elem(Pointer);
+    const ElementPointer = @TypeOf(&@as(Pointer, undefined)[0]);
     return struct {
-        ptr: info.Pointer,
+        ptr: Pointer,
         index: usize,
-        pub fn next(self: *@This()) ?info.Child {
+        pub fn next(self: *@This()) ?Element {
             if (self.index == 0) return null;
             self.index -= 1;
             return self.ptr[self.index];
         }
+        pub fn nextPtr(self: *@This()) ?ElementPointer {
+            if (self.index == 0) return null;
+            self.index -= 1;
+            return &self.ptr[self.index];
+        }
     };
 }
 
-/// Iterate over a slice in reverse.
+/// Iterates over a slice in reverse.
 pub fn reverseIterator(slice: anytype) ReverseIterator(@TypeOf(slice)) {
-    return .{ .ptr = slice.ptr, .index = slice.len };
+    const T = @TypeOf(slice);
+    if (comptime trait.isPtrTo(.Array)(T)) {
+        return .{ .ptr = slice, .index = slice.len };
+    } else {
+        comptime assert(trait.isSlice(T));
+        return .{ .ptr = slice.ptr, .index = slice.len };
+    }
 }
 
 test "reverseIterator" {
-    const slice: []const i32 = &[_]i32{ 5, 3, 1, 2 };
-    var it = reverseIterator(slice);
-    try testing.expectEqual(@as(?i32, 2), it.next());
-    try testing.expectEqual(@as(?i32, 1), it.next());
-    try testing.expectEqual(@as(?i32, 3), it.next());
-    try testing.expectEqual(@as(?i32, 5), it.next());
-    try testing.expectEqual(@as(?i32, null), it.next());
+    {
+        var it = reverseIterator("abc");
+        try testing.expectEqual(@as(?u8, 'c'), it.next());
+        try testing.expectEqual(@as(?u8, 'b'), it.next());
+        try testing.expectEqual(@as(?u8, 'a'), it.next());
+        try testing.expectEqual(@as(?u8, null), it.next());
+    }
+    {
+        var array = [2]i32{ 3, 7 };
+        const slice: []const i32 = &array;
+        var it = reverseIterator(slice);
+        try testing.expectEqual(@as(?i32, 7), it.next());
+        try testing.expectEqual(@as(?i32, 3), it.next());
+        try testing.expectEqual(@as(?i32, null), it.next());
+
+        it = reverseIterator(slice);
+        try testing.expect(trait.isConstPtr(@TypeOf(it.nextPtr().?)));
+        try testing.expectEqual(@as(?i32, 7), it.nextPtr().?.*);
+        try testing.expectEqual(@as(?i32, 3), it.nextPtr().?.*);
+        try testing.expectEqual(@as(?*const i32, null), it.nextPtr());
+
+        var mut_slice: []i32 = &array;
+        var mut_it = reverseIterator(mut_slice);
+        mut_it.nextPtr().?.* += 1;
+        mut_it.nextPtr().?.* += 2;
+        try testing.expectEqual([2]i32{ 5, 8 }, array);
+    }
+    {
+        var array = [2]i32{ 3, 7 };
+        const ptr_to_array: *const [2]i32 = &array;
+        var it = reverseIterator(ptr_to_array);
+        try testing.expectEqual(@as(?i32, 7), it.next());
+        try testing.expectEqual(@as(?i32, 3), it.next());
+        try testing.expectEqual(@as(?i32, null), it.next());
+
+        it = reverseIterator(ptr_to_array);
+        try testing.expect(trait.isConstPtr(@TypeOf(it.nextPtr().?)));
+        try testing.expectEqual(@as(?i32, 7), it.nextPtr().?.*);
+        try testing.expectEqual(@as(?i32, 3), it.nextPtr().?.*);
+        try testing.expectEqual(@as(?*const i32, null), it.nextPtr());
+
+        var mut_ptr_to_array: *[2]i32 = &array;
+        var mut_it = reverseIterator(mut_ptr_to_array);
+        mut_it.nextPtr().?.* += 1;
+        mut_it.nextPtr().?.* += 2;
+        try testing.expectEqual([2]i32{ 5, 8 }, array);
+    }
 }
 
 /// In-place rotation of the values in an array ([0 1 2 3] becomes [1 2 3 0] if we rotate by 1)
@@ -3139,7 +3167,7 @@ test "replace" {
 
 /// Replace all occurences of `needle` with `replacement`.
 pub fn replaceScalar(comptime T: type, slice: []T, needle: T, replacement: T) void {
-    for (slice) |e, i| {
+    for (slice, 0..) |e, i| {
         if (e == needle) {
             slice[i] = replacement;
         }
@@ -3394,7 +3422,7 @@ test "asBytes" {
     try testing.expect(eql(u8, asBytes(&deadbeef), deadbeef_bytes));
 
     var codeface = @as(u32, 0xC0DEFACE);
-    for (asBytes(&codeface).*) |*b|
+    for (asBytes(&codeface)) |*b|
         b.* = 0;
     try testing.expect(codeface == 0);
 
@@ -3771,7 +3799,7 @@ pub fn doNotOptimizeAway(val: anytype) void {
         .Bool => doNotOptimizeAway(@boolToInt(val)),
         .Int => {
             const bits = t.Int.bits;
-            if (bits <= max_gp_register_bits) {
+            if (bits <= max_gp_register_bits and builtin.zig_backend != .stage2_c) {
                 const val2 = @as(
                     std.meta.Int(t.Int.signedness, @max(8, std.math.ceilPowerOfTwoAssert(u16, bits))),
                     val,
@@ -3783,18 +3811,24 @@ pub fn doNotOptimizeAway(val: anytype) void {
             } else doNotOptimizeAway(&val);
         },
         .Float => {
-            if (t.Float.bits == 32 or t.Float.bits == 64) {
+            if ((t.Float.bits == 32 or t.Float.bits == 64) and builtin.zig_backend != .stage2_c) {
                 asm volatile (""
                     :
                     : [val] "rm" (val),
                 );
             } else doNotOptimizeAway(&val);
         },
-        .Pointer => asm volatile (""
-            :
-            : [val] "m" (val),
-            : "memory"
-        ),
+        .Pointer => {
+            if (builtin.zig_backend == .stage2_c) {
+                doNotOptimizeAwayC(val);
+            } else {
+                asm volatile (""
+                    :
+                    : [val] "m" (val),
+                    : "memory"
+                );
+            }
+        },
         .Array => {
             if (t.Array.len * @sizeOf(t.Array.child) <= 64) {
                 for (val) |v| doNotOptimizeAway(v);
@@ -3802,6 +3836,16 @@ pub fn doNotOptimizeAway(val: anytype) void {
         },
         else => doNotOptimizeAway(&val),
     }
+}
+
+/// .stage2_c doesn't support asm blocks yet, so use volatile stores instead
+var deopt_target: if (builtin.zig_backend == .stage2_c) u8 else void = undefined;
+fn doNotOptimizeAwayC(ptr: anytype) void {
+    const dest = @ptrCast(*volatile u8, &deopt_target);
+    for (asBytes(ptr)) |b| {
+        dest.* = b;
+    }
+    dest.* = 0;
 }
 
 test "doNotOptimizeAway" {

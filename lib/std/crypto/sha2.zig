@@ -142,6 +142,11 @@ fn Sha2x32(comptime params: Sha2Params32) type {
             d.total_len += b.len;
         }
 
+        pub fn peek(d: Self) [digest_length]u8 {
+            var copy = d;
+            return copy.finalResult();
+        }
+
         pub fn final(d: *Self, out: *[digest_length]u8) void {
             // The buffer here will never be completely full.
             mem.set(u8, d.buf[d.buf_len..], 0);
@@ -170,9 +175,15 @@ fn Sha2x32(comptime params: Sha2Params32) type {
             // May truncate for possible 224 output
             const rr = d.s[0 .. params.digest_bits / 32];
 
-            for (rr) |s, j| {
+            for (rr, 0..) |s, j| {
                 mem.writeIntBig(u32, out[4 * j ..][0..4], s);
             }
+        }
+
+        pub fn finalResult(d: *Self) [digest_length]u8 {
+            var result: [digest_length]u8 = undefined;
+            d.final(&result);
+            return result;
         }
 
         const W = [64]u32{
@@ -188,7 +199,7 @@ fn Sha2x32(comptime params: Sha2Params32) type {
 
         fn round(d: *Self, b: *const [64]u8) void {
             var s: [64]u32 align(16) = undefined;
-            for (@ptrCast(*align(1) const [16]u32, b)) |*elem, i| {
+            for (@ptrCast(*align(1) const [16]u32, b), 0..) |*elem, i| {
                 s[i] = mem.readIntBig(u32, mem.asBytes(elem));
             }
 
@@ -621,6 +632,11 @@ fn Sha2x64(comptime params: Sha2Params64) type {
             d.total_len += b.len;
         }
 
+        pub fn peek(d: Self) [digest_length]u8 {
+            var copy = d;
+            return copy.finalResult();
+        }
+
         pub fn final(d: *Self, out: *[digest_length]u8) void {
             // The buffer here will never be completely full.
             mem.set(u8, d.buf[d.buf_len..], 0);
@@ -649,9 +665,15 @@ fn Sha2x64(comptime params: Sha2Params64) type {
             // May truncate for possible 384 output
             const rr = d.s[0 .. params.digest_bits / 64];
 
-            for (rr) |s, j| {
+            for (rr, 0..) |s, j| {
                 mem.writeIntBig(u64, out[8 * j ..][0..8], s);
             }
+        }
+
+        pub fn finalResult(d: *Self) [digest_length]u8 {
+            var result: [digest_length]u8 = undefined;
+            d.final(&result);
+            return result;
         }
 
         fn round(d: *Self, b: *const [128]u8) void {

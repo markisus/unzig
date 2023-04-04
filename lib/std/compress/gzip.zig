@@ -1,7 +1,7 @@
 //
 // Decompressor for GZIP data streams (RFC1952)
 
-const std = @import("std");
+const std = @import("../std.zig");
 const io = std.io;
 const fs = std.fs;
 const testing = std.testing;
@@ -17,7 +17,7 @@ const FCOMMENT = 1 << 4;
 
 const max_string_len = 1024;
 
-pub fn GzipStream(comptime ReaderType: type) type {
+pub fn Decompress(comptime ReaderType: type) type {
     return struct {
         const Self = @This();
 
@@ -41,8 +41,11 @@ pub fn GzipStream(comptime ReaderType: type) type {
         },
 
         fn init(allocator: mem.Allocator, source: ReaderType) !Self {
+            var hasher = std.compress.hashedReader(source, std.hash.Crc32.init());
+            const hashed_reader = hasher.reader();
+
             // gzip header format is specified in RFC1952
-            const header = try source.readBytesNoEof(10);
+            const header = try hashed_reader.readBytesNoEof(10);
 
             // Check the ID1/ID2 fields
             if (header[0] != 0x1f or header[1] != 0x8b)
@@ -63,31 +66,31 @@ pub fn GzipStream(comptime ReaderType: type) type {
             _ = XFL;
 
             const extra = if (FLG & FEXTRA != 0) blk: {
-                const len = try source.readIntLittle(u16);
+                const len = try hashed_reader.readIntLittle(u16);
                 const tmp_buf = try allocator.alloc(u8, len);
                 errdefer allocator.free(tmp_buf);
 
-                try source.readNoEof(tmp_buf);
+                try hashed_reader.readNoEof(tmp_buf);
                 break :blk tmp_buf;
             } else null;
             errdefer if (extra) |p| allocator.free(p);
 
             const filename = if (FLG & FNAME != 0)
-                try source.readUntilDelimiterAlloc(allocator, 0, max_string_len)
+                try hashed_reader.readUntilDelimiterAlloc(allocator, 0, max_string_len)
             else
                 null;
             errdefer if (filename) |p| allocator.free(p);
 
             const comment = if (FLG & FCOMMENT != 0)
-                try source.readUntilDelimiterAlloc(allocator, 0, max_string_len)
+                try hashed_reader.readUntilDelimiterAlloc(allocator, 0, max_string_len)
             else
                 null;
             errdefer if (comment) |p| allocator.free(p);
 
             if (FLG & FHCRC != 0) {
-                // TODO: Evaluate and check the header checksum. The stdlib has
-                // no CRC16 yet :(
-                _ = try source.readIntLittle(u16);
+                const hash = try source.readIntLittle(u16);
+                if (hash != @truncate(u16, hasher.hasher.final()))
+                    return error.WrongChecksum;
             }
 
             return Self{
@@ -148,14 +151,14 @@ pub fn GzipStream(comptime ReaderType: type) type {
     };
 }
 
-pub fn gzipStream(allocator: mem.Allocator, reader: anytype) !GzipStream(@TypeOf(reader)) {
-    return GzipStream(@TypeOf(reader)).init(allocator, reader);
+pub fn decompress(allocator: mem.Allocator, reader: anytype) !Decompress(@TypeOf(reader)) {
+    return Decompress(@TypeOf(reader)).init(allocator, reader);
 }
 
 fn testReader(data: []const u8, comptime expected: []const u8) !void {
     var in_stream = io.fixedBufferStream(data);
 
-    var gzip_stream = try gzipStream(testing.allocator, in_stream.reader());
+    var gzip_stream = try decompress(testing.allocator, in_stream.reader());
     defer gzip_stream.deinit();
 
     // Read and decompress the whole file
@@ -226,4 +229,17 @@ test "sanity checks" {
             0x00, 0x00, 0x00,
         }, ""),
     );
+}
+
+test "header checksum" {
+    try testReader(&[_]u8{
+        // GZIP header
+        0x1f, 0x8b, 0x08, 0x12, 0x00, 0x09, 0x6e, 0x88, 0x00, 0xff, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x00,
+
+        // header.FHCRC (should cover entire header)
+        0x99, 0xd6,
+
+        // GZIP data
+        0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    }, "");
 }

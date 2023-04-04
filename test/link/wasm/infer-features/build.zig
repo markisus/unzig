@@ -1,27 +1,38 @@
 const std = @import("std");
 
-pub fn build(b: *std.build.Builder) void {
-    const mode = b.standardReleaseOptions();
+pub const requires_stage2 = true;
 
+pub fn build(b: *std.Build) void {
     // Wasm Object file which we will use to infer the features from
-    const c_obj = b.addObject("c_obj", null);
-    c_obj.setTarget(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-    c_obj.target.cpu_model = .{ .explicit = &std.Target.wasm.cpu.bleeding_edge };
+    const c_obj = b.addObject(.{
+        .name = "c_obj",
+        .optimize = .Debug,
+        .target = .{
+            .cpu_arch = .wasm32,
+            .cpu_model = .{ .explicit = &std.Target.wasm.cpu.bleeding_edge },
+            .os_tag = .freestanding,
+        },
+    });
     c_obj.addCSourceFile("foo.c", &.{});
-    c_obj.setBuildMode(mode);
 
     // Wasm library that doesn't have any features specified. This will
     // infer its featureset from other linked object files.
-    const lib = b.addSharedLibrary("lib", "main.zig", .unversioned);
-    lib.setTarget(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-    lib.target.cpu_model = .{ .explicit = &std.Target.wasm.cpu.mvp };
-    lib.setBuildMode(mode);
+    const lib = b.addSharedLibrary(.{
+        .name = "lib",
+        .root_source_file = .{ .path = "main.zig" },
+        .optimize = .Debug,
+        .target = .{
+            .cpu_arch = .wasm32,
+            .cpu_model = .{ .explicit = &std.Target.wasm.cpu.mvp },
+            .os_tag = .freestanding,
+        },
+    });
     lib.use_llvm = false;
     lib.use_lld = false;
     lib.addObject(c_obj);
 
     // Verify the result contains the features from the C Object file.
-    const check = lib.checkObject(.wasm);
+    const check = lib.checkObject();
     check.checkStart("name target_features");
     check.checkNext("features 7");
     check.checkNext("+ atomics");
@@ -34,4 +45,5 @@ pub fn build(b: *std.build.Builder) void {
 
     const test_step = b.step("test", "Run linker test");
     test_step.dependOn(&check.step);
+    b.default_step = test_step;
 }

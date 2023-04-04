@@ -68,7 +68,7 @@ pub const Thunk = struct {
     }
 };
 
-pub fn createThunks(zld: *Zld, sect_id: u8, reverse_lookups: [][]u32) !void {
+pub fn createThunks(zld: *Zld, sect_id: u8) !void {
     const header = &zld.sections.items(.header)[sect_id];
     if (header.size == 0) return;
 
@@ -140,7 +140,6 @@ pub fn createThunks(zld: *Zld, sect_id: u8, reverse_lookups: [][]u32) !void {
             try scanRelocs(
                 zld,
                 atom_index,
-                reverse_lookups[atom.getFile().?],
                 allocated,
                 thunk_index,
                 group_end,
@@ -214,7 +213,6 @@ fn allocateThunk(
 fn scanRelocs(
     zld: *Zld,
     atom_index: AtomIndex,
-    reverse_lookup: []u32,
     allocated: std.AutoHashMap(AtomIndex, void),
     thunk_index: ThunkIndex,
     group_end: AtomIndex,
@@ -227,11 +225,20 @@ fn scanRelocs(
         break :blk @intCast(i32, source_sym.n_value - source_sect.addr);
     } else 0;
 
+    const code = Atom.getAtomCode(zld, atom_index);
     const relocs = Atom.getAtomRelocs(zld, atom_index);
+    const ctx = Atom.getRelocContext(zld, atom_index);
+
     for (relocs) |rel| {
         if (!relocNeedsThunk(rel)) continue;
 
-        const target = Atom.parseRelocTarget(zld, atom_index, rel, reverse_lookup);
+        const target = Atom.parseRelocTarget(zld, .{
+            .object_id = atom.getFile().?,
+            .rel = rel,
+            .code = code,
+            .base_offset = ctx.base_offset,
+            .base_addr = ctx.base_addr,
+        });
         if (isReachable(zld, atom_index, rel, base_offset, target, allocated)) continue;
 
         log.debug("{x}: source = {s}@{x}, target = {s}@{x} unreachable", .{
@@ -308,7 +315,8 @@ fn isReachable(
     if (!allocated.contains(target_atom_index)) return false;
 
     const source_addr = source_sym.n_value + @intCast(u32, rel.r_address - base_offset);
-    const target_addr = Atom.getRelocTargetAddress(zld, rel, target, false) catch unreachable;
+    const is_via_got = Atom.relocRequiresGot(zld, rel);
+    const target_addr = Atom.getRelocTargetAddress(zld, target, is_via_got, false) catch unreachable;
     _ = Atom.calcPcRelativeDisplacementArm64(source_addr, target_addr) catch
         return false;
 
@@ -330,7 +338,7 @@ fn createThunkAtom(zld: *Zld) !AtomIndex {
 fn getThunkIndex(zld: *Zld, atom_index: AtomIndex) ?ThunkIndex {
     const atom = zld.getAtom(atom_index);
     const sym = zld.getSymbol(atom.getSymbolWithLoc());
-    for (zld.thunks.items) |thunk, i| {
+    for (zld.thunks.items, 0..) |thunk, i| {
         if (thunk.len == 0) continue;
 
         const thunk_atom_index = thunk.getStartAtomIndex();

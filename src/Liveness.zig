@@ -226,6 +226,7 @@ pub fn categorizeOperand(
         .ret_ptr,
         .constant,
         .const_ty,
+        .trap,
         .breakpoint,
         .dbg_stmt,
         .dbg_inline_begin,
@@ -239,6 +240,9 @@ pub fn categorizeOperand(
         .err_return_trace,
         .save_err_return_trace_index,
         .c_va_start,
+        .work_item_id,
+        .work_group_size,
+        .work_group_id,
         => return .none,
 
         .fence => return .write,
@@ -384,7 +388,7 @@ pub fn categorizeOperand(
             const args = @ptrCast([]const Air.Inst.Ref, air.extra[extra.end..][0..extra.data.args_len]);
             if (args.len + 1 <= bpi - 1) {
                 if (callee == operand_ref) return matchOperandSmallIndex(l, inst, 0, .write);
-                for (args) |arg, i| {
+                for (args, 0..) |arg, i| {
                     if (arg == operand_ref) return matchOperandSmallIndex(l, inst, @intCast(OperandInt, i + 1), .write);
                 }
                 return .write;
@@ -436,7 +440,7 @@ pub fn categorizeOperand(
             const elements = @ptrCast([]const Air.Inst.Ref, air.extra[ty_pl.payload..][0..len]);
 
             if (elements.len <= bpi - 1) {
-                for (elements) |elem, i| {
+                for (elements, 0..) |elem, i| {
                     if (elem == operand_ref) return matchOperandSmallIndex(l, inst, @intCast(OperandInt, i), .none);
                 }
                 return .none;
@@ -848,6 +852,7 @@ fn analyzeInst(
         .ret_ptr,
         .constant,
         .const_ty,
+        .trap,
         .breakpoint,
         .dbg_stmt,
         .dbg_inline_begin,
@@ -862,6 +867,9 @@ fn analyzeInst(
         .err_return_trace,
         .save_err_return_trace_index,
         .c_va_start,
+        .work_item_id,
+        .work_group_size,
+        .work_group_id,
         => return trackOperands(a, new_set, inst, main_tomb, .{ .none, .none, .none }),
 
         .not,
@@ -1272,12 +1280,12 @@ fn analyzeInst(
             defer for (case_deaths) |*cd| cd.deinit(gpa);
 
             var total_deaths: u32 = 0;
-            for (case_tables) |*ct, i| {
+            for (case_tables, 0..) |*ct, i| {
                 total_deaths += ct.count();
                 var it = ct.keyIterator();
                 while (it.next()) |key| {
                     const case_death = key.*;
-                    for (case_tables) |*ct_inner, j| {
+                    for (case_tables, 0..) |*ct_inner, j| {
                         if (i == j) continue;
                         if (!ct_inner.contains(case_death)) {
                             // instruction is not referenced in this case

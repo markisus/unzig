@@ -1,34 +1,34 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Builder = std.build.Builder;
-const CrossTarget = std.zig.CrossTarget;
 
-// TODO integrate this with the std.build executor API
-fn isRunnableTarget(t: CrossTarget) bool {
-    if (t.isNative()) return true;
+pub fn build(b: *std.Build) void {
+    const test_step = b.step("test", "Test it");
+    b.default_step = test_step;
 
-    return (t.getOsTag() == builtin.os.tag and
-        t.getCpuArch() == builtin.cpu.arch);
+    add(b, test_step, .Debug);
+    add(b, test_step, .ReleaseFast);
+    add(b, test_step, .ReleaseSmall);
+    add(b, test_step, .ReleaseSafe);
 }
 
-pub fn build(b: *Builder) void {
-    const mode = b.standardReleaseOptions();
-    const target = b.standardTargetOptions(.{});
+fn add(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
+    const target: std.zig.CrossTarget = .{};
 
-    const test_step = b.step("test", "Test the program");
-
-    const exe_c = b.addExecutable("test_c", null);
-    b.default_step.dependOn(&exe_c.step);
+    const exe_c = b.addExecutable(.{
+        .name = "test_c",
+        .optimize = optimize,
+        .target = target,
+    });
     exe_c.addCSourceFile("test.c", &[0][]const u8{});
-    exe_c.setBuildMode(mode);
-    exe_c.setTarget(target);
     exe_c.linkLibC();
 
-    const exe_cpp = b.addExecutable("test_cpp", null);
+    const exe_cpp = b.addExecutable(.{
+        .name = "test_cpp",
+        .optimize = optimize,
+        .target = target,
+    });
     b.default_step.dependOn(&exe_cpp.step);
     exe_cpp.addCSourceFile("test.cpp", &[0][]const u8{});
-    exe_cpp.setBuildMode(mode);
-    exe_cpp.setTarget(target);
     exe_cpp.linkLibCpp();
 
     switch (target.getOsTag()) {
@@ -44,13 +44,13 @@ pub fn build(b: *Builder) void {
         else => {},
     }
 
-    if (isRunnableTarget(target)) {
-        const run_c_cmd = exe_c.run();
-        test_step.dependOn(&run_c_cmd.step);
-        const run_cpp_cmd = exe_cpp.run();
-        test_step.dependOn(&run_cpp_cmd.step);
-    } else {
-        test_step.dependOn(&exe_c.step);
-        test_step.dependOn(&exe_cpp.step);
-    }
+    const run_c_cmd = b.addRunArtifact(exe_c);
+    run_c_cmd.expectExitCode(0);
+    run_c_cmd.skip_foreign_checks = true;
+    test_step.dependOn(&run_c_cmd.step);
+
+    const run_cpp_cmd = b.addRunArtifact(exe_cpp);
+    run_cpp_cmd.expectExitCode(0);
+    run_cpp_cmd.skip_foreign_checks = true;
+    test_step.dependOn(&run_cpp_cmd.step);
 }

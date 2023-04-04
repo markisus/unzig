@@ -1,20 +1,26 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Builder = std.build.Builder;
-const LibExeObjectStep = std.build.LibExeObjStep;
 
-pub fn build(b: *Builder) void {
-    const mode = b.standardReleaseOptions();
+pub const requires_symlinks = true;
+pub const requires_macos_sdk = true;
 
-    const test_step = b.step("test", "Test");
-    test_step.dependOn(b.getInstallStep());
+pub fn build(b: *std.Build) void {
+    const test_step = b.step("test", "Test it");
+    b.default_step = test_step;
 
+    add(b, test_step, .Debug);
+    add(b, test_step, .ReleaseFast);
+    add(b, test_step, .ReleaseSmall);
+    add(b, test_step, .ReleaseSafe);
+}
+
+fn add(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode) void {
     {
         // Test -headerpad_max_install_names
-        const exe = simpleExe(b, mode);
+        const exe = simpleExe(b, optimize, "headerpad_max_install_names");
         exe.headerpad_max_install_names = true;
 
-        const check = exe.checkObject(.macho);
+        const check = exe.checkObject();
         check.checkStart("sectname __text");
         check.checkNext("offset {offset}");
 
@@ -36,10 +42,10 @@ pub fn build(b: *Builder) void {
 
     {
         // Test -headerpad
-        const exe = simpleExe(b, mode);
+        const exe = simpleExe(b, optimize, "headerpad");
         exe.headerpad_size = 0x10000;
 
-        const check = exe.checkObject(.macho);
+        const check = exe.checkObject();
         check.checkStart("sectname __text");
         check.checkNext("offset {offset}");
         check.checkComputeCompare("offset", .{ .op = .gte, .value = .{ .literal = 0x10000 } });
@@ -52,11 +58,11 @@ pub fn build(b: *Builder) void {
 
     {
         // Test both flags with -headerpad overriding -headerpad_max_install_names
-        const exe = simpleExe(b, mode);
+        const exe = simpleExe(b, optimize, "headerpad_overriding");
         exe.headerpad_max_install_names = true;
         exe.headerpad_size = 0x10000;
 
-        const check = exe.checkObject(.macho);
+        const check = exe.checkObject();
         check.checkStart("sectname __text");
         check.checkNext("offset {offset}");
         check.checkComputeCompare("offset", .{ .op = .gte, .value = .{ .literal = 0x10000 } });
@@ -69,11 +75,11 @@ pub fn build(b: *Builder) void {
 
     {
         // Test both flags with -headerpad_max_install_names overriding -headerpad
-        const exe = simpleExe(b, mode);
+        const exe = simpleExe(b, optimize, "headerpad_max_install_names_overriding");
         exe.headerpad_size = 0x1000;
         exe.headerpad_max_install_names = true;
 
-        const check = exe.checkObject(.macho);
+        const check = exe.checkObject();
         check.checkStart("sectname __text");
         check.checkNext("offset {offset}");
 
@@ -94,9 +100,15 @@ pub fn build(b: *Builder) void {
     }
 }
 
-fn simpleExe(b: *Builder, mode: std.builtin.Mode) *LibExeObjectStep {
-    const exe = b.addExecutable("main", null);
-    exe.setBuildMode(mode);
+fn simpleExe(
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    name: []const u8,
+) *std.Build.CompileStep {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .optimize = optimize,
+    });
     exe.addCSourceFile("main.c", &.{});
     exe.linkLibC();
     exe.linkFramework("CoreFoundation");

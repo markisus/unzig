@@ -50,7 +50,7 @@ fn AesGcm(comptime Aes: anytype) type {
             mem.writeIntBig(u64, final_block[8..16], m.len * 8);
             mac.update(&final_block);
             mac.final(tag);
-            for (t) |x, i| {
+            for (t, 0..) |x, i| {
                 tag[i] ^= x;
             }
         }
@@ -82,16 +82,16 @@ fn AesGcm(comptime Aes: anytype) type {
             mac.update(&final_block);
             var computed_tag: [Ghash.mac_length]u8 = undefined;
             mac.final(&computed_tag);
-            for (t) |x, i| {
+            for (t, 0..) |x, i| {
                 computed_tag[i] ^= x;
             }
 
             var acc: u8 = 0;
-            for (computed_tag) |_, p| {
+            for (computed_tag, 0..) |_, p| {
                 acc |= (computed_tag[p] ^ tag[p]);
             }
             if (acc != 0) {
-                mem.set(u8, m, 0xaa);
+                @memset(m.ptr, undefined, m.len);
                 return error.AuthenticationFailed;
             }
 

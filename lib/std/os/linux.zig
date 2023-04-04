@@ -40,6 +40,7 @@ const arch_bits = switch (native_arch) {
     .riscv64 => @import("linux/riscv64.zig"),
     .sparc64 => @import("linux/sparc64.zig"),
     .mips, .mipsel => @import("linux/mips.zig"),
+    .mips64, .mips64el => @import("linux/mips64.zig"),
     .powerpc => @import("linux/powerpc.zig"),
     .powerpc64, .powerpc64le => @import("linux/powerpc64.zig"),
     else => struct {},
@@ -101,6 +102,7 @@ pub const SYS = switch (@import("builtin").cpu.arch) {
     .riscv64 => syscalls.RiscV64,
     .sparc64 => syscalls.Sparc64,
     .mips, .mipsel => syscalls.Mips,
+    .mips64, .mips64el => syscalls.Mips64,
     .powerpc => syscalls.PowerPC,
     .powerpc64, .powerpc64le => syscalls.PowerPC64,
     else => @compileError("The Zig Standard Library is missing syscall definitions for the target CPU architecture"),
@@ -767,12 +769,30 @@ pub fn fchmod(fd: i32, mode: mode_t) usize {
     return syscall2(.fchmod, @bitCast(usize, @as(isize, fd)), mode);
 }
 
+pub fn chmod(path: [*:0]const u8, mode: mode_t) usize {
+    if (@hasField(SYS, "chmod")) {
+        return syscall2(.chmod, @ptrToInt(path), mode);
+    } else {
+        return syscall4(
+            .fchmodat,
+            @bitCast(usize, @as(isize, AT.FDCWD)),
+            @ptrToInt(path),
+            mode,
+            0,
+        );
+    }
+}
+
 pub fn fchown(fd: i32, owner: uid_t, group: gid_t) usize {
     if (@hasField(SYS, "fchown32")) {
         return syscall3(.fchown32, @bitCast(usize, @as(isize, fd)), owner, group);
     } else {
         return syscall3(.fchown, @bitCast(usize, @as(isize, fd)), owner, group);
     }
+}
+
+pub fn fchmodat(fd: i32, path: [*:0]const u8, mode: mode_t, flags: u32) usize {
+    return syscall4(.fchmodat, @bitCast(usize, @as(isize, fd)), @ptrToInt(path), mode, flags);
 }
 
 /// Can only be called on 32 bit systems. For 64 bit see `lseek`.
@@ -922,6 +942,16 @@ pub fn unlinkat(dirfd: i32, path: [*:0]const u8, flags: u32) usize {
 
 pub fn waitpid(pid: pid_t, status: *u32, flags: u32) usize {
     return syscall4(.wait4, @bitCast(usize, @as(isize, pid)), @ptrToInt(status), flags, 0);
+}
+
+pub fn wait4(pid: pid_t, status: *u32, flags: u32, usage: ?*rusage) usize {
+    return syscall4(
+        .wait4,
+        @bitCast(usize, @as(isize, pid)),
+        @ptrToInt(status),
+        flags,
+        @ptrToInt(usage),
+    );
 }
 
 pub fn waitid(id_type: P, id: i32, infop: *siginfo_t, flags: u32) usize {
@@ -1226,11 +1256,14 @@ pub fn getsockopt(fd: i32, level: u32, optname: u32, noalias optval: [*]u8, noal
     return syscall5(.getsockopt, @bitCast(usize, @as(isize, fd)), level, optname, @ptrToInt(optval), @ptrToInt(optlen));
 }
 
-pub fn sendmsg(fd: i32, msg: *const std.x.os.Socket.Message, flags: c_int) usize {
+pub fn sendmsg(fd: i32, msg: *const msghdr_const, flags: u32) usize {
+    const fd_usize = @bitCast(usize, @as(isize, fd));
+    const msg_usize = @ptrToInt(msg);
     if (native_arch == .x86) {
-        return socketcall(SC.sendmsg, &[3]usize{ @bitCast(usize, @as(isize, fd)), @ptrToInt(msg), @bitCast(usize, @as(isize, flags)) });
+        return socketcall(SC.sendmsg, &[3]usize{ fd_usize, msg_usize, flags });
+    } else {
+        return syscall3(.sendmsg, fd_usize, msg_usize, flags);
     }
-    return syscall3(.sendmsg, @bitCast(usize, @as(isize, fd)), @ptrToInt(msg), @bitCast(usize, @as(isize, flags)));
 }
 
 pub fn sendmmsg(fd: i32, msgvec: [*]mmsghdr_const, vlen: u32, flags: u32) usize {
@@ -1240,7 +1273,7 @@ pub fn sendmmsg(fd: i32, msgvec: [*]mmsghdr_const, vlen: u32, flags: u32) usize 
         // see https://www.openwall.com/lists/musl/2014/06/07/5
         const kvlen = if (vlen > IOV_MAX) IOV_MAX else vlen; // matches kernel
         var next_unsent: usize = 0;
-        for (msgvec[0..kvlen]) |*msg, i| {
+        for (msgvec[0..kvlen], 0..) |*msg, i| {
             var size: i32 = 0;
             const msg_iovlen = @intCast(usize, msg.msg_hdr.msg_iovlen); // kernel side this is treated as unsigned
             for (msg.msg_hdr.msg_iov[0..msg_iovlen]) |iov| {
@@ -1274,24 +1307,42 @@ pub fn sendmmsg(fd: i32, msgvec: [*]mmsghdr_const, vlen: u32, flags: u32) usize 
 }
 
 pub fn connect(fd: i32, addr: *const anyopaque, len: socklen_t) usize {
+    const fd_usize = @bitCast(usize, @as(isize, fd));
+    const addr_usize = @ptrToInt(addr);
     if (native_arch == .x86) {
-        return socketcall(SC.connect, &[3]usize{ @bitCast(usize, @as(isize, fd)), @ptrToInt(addr), len });
+        return socketcall(SC.connect, &[3]usize{ fd_usize, addr_usize, len });
+    } else {
+        return syscall3(.connect, fd_usize, addr_usize, len);
     }
-    return syscall3(.connect, @bitCast(usize, @as(isize, fd)), @ptrToInt(addr), len);
 }
 
-pub fn recvmsg(fd: i32, msg: *std.x.os.Socket.Message, flags: c_int) usize {
+pub fn recvmsg(fd: i32, msg: *msghdr, flags: u32) usize {
+    const fd_usize = @bitCast(usize, @as(isize, fd));
+    const msg_usize = @ptrToInt(msg);
     if (native_arch == .x86) {
-        return socketcall(SC.recvmsg, &[3]usize{ @bitCast(usize, @as(isize, fd)), @ptrToInt(msg), @bitCast(usize, @as(isize, flags)) });
+        return socketcall(SC.recvmsg, &[3]usize{ fd_usize, msg_usize, flags });
+    } else {
+        return syscall3(.recvmsg, fd_usize, msg_usize, flags);
     }
-    return syscall3(.recvmsg, @bitCast(usize, @as(isize, fd)), @ptrToInt(msg), @bitCast(usize, @as(isize, flags)));
 }
 
-pub fn recvfrom(fd: i32, noalias buf: [*]u8, len: usize, flags: u32, noalias addr: ?*sockaddr, noalias alen: ?*socklen_t) usize {
+pub fn recvfrom(
+    fd: i32,
+    noalias buf: [*]u8,
+    len: usize,
+    flags: u32,
+    noalias addr: ?*sockaddr,
+    noalias alen: ?*socklen_t,
+) usize {
+    const fd_usize = @bitCast(usize, @as(isize, fd));
+    const buf_usize = @ptrToInt(buf);
+    const addr_usize = @ptrToInt(addr);
+    const alen_usize = @ptrToInt(alen);
     if (native_arch == .x86) {
-        return socketcall(SC.recvfrom, &[6]usize{ @bitCast(usize, @as(isize, fd)), @ptrToInt(buf), len, flags, @ptrToInt(addr), @ptrToInt(alen) });
+        return socketcall(SC.recvfrom, &[6]usize{ fd_usize, buf_usize, len, flags, addr_usize, alen_usize });
+    } else {
+        return syscall6(.recvfrom, fd_usize, buf_usize, len, flags, addr_usize, alen_usize);
     }
-    return syscall6(.recvfrom, @bitCast(usize, @as(isize, fd)), @ptrToInt(buf), len, flags, @ptrToInt(addr), @ptrToInt(alen));
 }
 
 pub fn shutdown(fd: i32, how: i32) usize {
@@ -1675,26 +1726,26 @@ pub fn pidfd_send_signal(pidfd: fd_t, sig: i32, info: ?*siginfo_t, flags: u32) u
     );
 }
 
-pub fn process_vm_readv(pid: pid_t, local: [*]const iovec, local_count: usize, remote: [*]const iovec, remote_count: usize, flags: usize) usize {
+pub fn process_vm_readv(pid: pid_t, local: []iovec, remote: []const iovec_const, flags: usize) usize {
     return syscall6(
         .process_vm_readv,
         @bitCast(usize, @as(isize, pid)),
-        @ptrToInt(local),
-        local_count,
-        @ptrToInt(remote),
-        remote_count,
+        @ptrToInt(local.ptr),
+        local.len,
+        @ptrToInt(remote.ptr),
+        remote.len,
         flags,
     );
 }
 
-pub fn process_vm_writev(pid: pid_t, local: [*]const iovec, local_count: usize, remote: [*]const iovec, remote_count: usize, flags: usize) usize {
+pub fn process_vm_writev(pid: pid_t, local: []const iovec_const, remote: []const iovec_const, flags: usize) usize {
     return syscall6(
         .process_vm_writev,
         @bitCast(usize, @as(isize, pid)),
-        @ptrToInt(local),
-        local_count,
-        @ptrToInt(remote),
-        remote_count,
+        @ptrToInt(local.ptr),
+        local.len,
+        @ptrToInt(remote.ptr),
+        remote.len,
         flags,
     );
 }
@@ -1777,6 +1828,23 @@ pub fn perf_event_open(
 
 pub fn seccomp(operation: u32, flags: u32, args: ?*const anyopaque) usize {
     return syscall3(.seccomp, operation, flags, @ptrToInt(args));
+}
+
+pub fn ptrace(
+    req: u32,
+    pid: pid_t,
+    addr: usize,
+    data: usize,
+    addr2: usize,
+) usize {
+    return syscall5(
+        .ptrace,
+        req,
+        @bitCast(usize, @as(isize, pid)),
+        addr,
+        data,
+        addr2,
+    );
 }
 
 pub const E = switch (native_arch) {
@@ -3219,7 +3287,15 @@ pub const sockaddr = extern struct {
     data: [14]u8,
 
     pub const SS_MAXSIZE = 128;
-    pub const storage = std.x.os.Socket.Address.Native.Storage;
+    pub const storage = extern struct {
+        family: sa_family_t align(8),
+        padding: [SS_MAXSIZE - @sizeOf(sa_family_t)]u8 = undefined,
+
+        comptime {
+            assert(@sizeOf(storage) == SS_MAXSIZE);
+            assert(@alignOf(storage) == 8);
+        }
+    };
 
     /// IPv4 socket address
     pub const in = extern struct {
@@ -5671,4 +5747,41 @@ pub const AUDIT = struct {
             return res;
         }
     };
+};
+
+pub const PTRACE = struct {
+    pub const TRACEME = 0;
+    pub const PEEKTEXT = 1;
+    pub const PEEKDATA = 2;
+    pub const PEEKUSER = 3;
+    pub const POKETEXT = 4;
+    pub const POKEDATA = 5;
+    pub const POKEUSER = 6;
+    pub const CONT = 7;
+    pub const KILL = 8;
+    pub const SINGLESTEP = 9;
+    pub const GETREGS = 12;
+    pub const SETREGS = 13;
+    pub const GETFPREGS = 14;
+    pub const SETFPREGS = 15;
+    pub const ATTACH = 16;
+    pub const DETACH = 17;
+    pub const GETFPXREGS = 18;
+    pub const SETFPXREGS = 19;
+    pub const SYSCALL = 24;
+    pub const SETOPTIONS = 0x4200;
+    pub const GETEVENTMSG = 0x4201;
+    pub const GETSIGINFO = 0x4202;
+    pub const SETSIGINFO = 0x4203;
+    pub const GETREGSET = 0x4204;
+    pub const SETREGSET = 0x4205;
+    pub const SEIZE = 0x4206;
+    pub const INTERRUPT = 0x4207;
+    pub const LISTEN = 0x4208;
+    pub const PEEKSIGINFO = 0x4209;
+    pub const GETSIGMASK = 0x420a;
+    pub const SETSIGMASK = 0x420b;
+    pub const SECCOMP_GET_FILTER = 0x420c;
+    pub const SECCOMP_GET_METADATA = 0x420d;
+    pub const GET_SYSCALL_INFO = 0x420e;
 };

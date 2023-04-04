@@ -96,7 +96,6 @@ test "discard the result of a function that returns a struct" {
 }
 
 test "inline function call that calls optional function pointer, return pointer at callsite interacts correctly with callsite return type" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -275,7 +274,6 @@ test "implicit cast fn call result to optional in field result" {
 }
 
 test "void parameters" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
 
@@ -300,7 +298,6 @@ fn acceptsString(foo: []u8) void {
 }
 
 test "function pointers" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -311,7 +308,7 @@ test "function pointers" {
         &fn3,
         &fn4,
     };
-    for (fns) |f, i| {
+    for (fns, 0..) |f, i| {
         try expect(f() == @intCast(u32, i) + 5);
     }
 }
@@ -516,4 +513,27 @@ test "peer type resolution of inferred error set with non-void payload" {
         }
     };
     try expect(try S.openDataFile(.read) == 1);
+}
+
+test "lazy values passed to anytype parameter" {
+    const A = struct {
+        a: u32,
+        fn foo(comptime a: anytype) !void {
+            try expect(a[0][0] == @sizeOf(@This()));
+        }
+    };
+    try A.foo(.{[_]usize{@sizeOf(A)}});
+
+    const B = struct {
+        fn foo(comptime a: anytype) !void {
+            try expect(a.x == 0);
+        }
+    };
+    try B.foo(.{ .x = @sizeOf(B) });
+
+    const C = struct {};
+    try expect(@truncate(u32, @sizeOf(C)) == 0);
+
+    const D = struct {};
+    try expect(@sizeOf(D) << 1 == 0);
 }

@@ -14,6 +14,12 @@ impl: {
     break :impl @import("aes/soft.zig");
 };
 
+/// `true` if AES is backed by hardware (AES-NI on x86_64, ARM Crypto Extensions on AArch64).
+/// Software implementations are much slower, and should be avoided if possible.
+pub const has_hardware_support =
+    (builtin.cpu.arch == .x86_64 and has_aesni and has_avx) or
+    (builtin.cpu.arch == .aarch64 and has_armaes);
+
 pub const Block = impl.Block;
 pub const AesEncryptCtx = impl.AesEncryptCtx;
 pub const AesDecryptCtx = impl.AesDecryptCtx;
@@ -115,11 +121,11 @@ test "expand 128-bit key" {
     const dec = Aes128.initDec(key);
     var exp: [16]u8 = undefined;
 
-    for (enc.key_schedule.round_keys) |round_key, i| {
+    for (enc.key_schedule.round_keys, 0..) |round_key, i| {
         _ = try std.fmt.hexToBytes(&exp, exp_enc[i]);
         try testing.expectEqualSlices(u8, &exp, &round_key.toBytes());
     }
-    for (dec.key_schedule.round_keys) |round_key, i| {
+    for (dec.key_schedule.round_keys, 0..) |round_key, i| {
         _ = try std.fmt.hexToBytes(&exp, exp_dec[i]);
         try testing.expectEqualSlices(u8, &exp, &round_key.toBytes());
     }
@@ -154,11 +160,11 @@ test "expand 256-bit key" {
     const dec = Aes256.initDec(key);
     var exp: [16]u8 = undefined;
 
-    for (enc.key_schedule.round_keys) |round_key, i| {
+    for (enc.key_schedule.round_keys, 0..) |round_key, i| {
         _ = try std.fmt.hexToBytes(&exp, exp_enc[i]);
         try testing.expectEqualSlices(u8, &exp, &round_key.toBytes());
     }
-    for (dec.key_schedule.round_keys) |round_key, i| {
+    for (dec.key_schedule.round_keys, 0..) |round_key, i| {
         _ = try std.fmt.hexToBytes(&exp, exp_dec[i]);
         try testing.expectEqualSlices(u8, &exp, &round_key.toBytes());
     }

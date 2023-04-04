@@ -100,7 +100,6 @@ test "@clz vectors" {
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     try testClzVectors();
@@ -163,7 +162,6 @@ test "@ctz vectors" {
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     if (builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .aarch64) {
@@ -377,6 +375,28 @@ fn testBinaryNot(x: u16) !void {
     try expect(~x == 0b0101010101010101);
 }
 
+test "binary not 128-bit" {
+    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+
+    try expect(comptime x: {
+        break :x ~@as(u128, 0x55555555_55555555_55555555_55555555) == 0xaaaaaaaa_aaaaaaaa_aaaaaaaa_aaaaaaaa;
+    });
+    try expect(comptime x: {
+        break :x ~@as(i128, 0x55555555_55555555_55555555_55555555) == @bitCast(i128, @as(u128, 0xaaaaaaaa_aaaaaaaa_aaaaaaaa_aaaaaaaa));
+    });
+
+    try testBinaryNot128(u128, 0xaaaaaaaa_aaaaaaaa_aaaaaaaa_aaaaaaaa);
+    try testBinaryNot128(i128, @bitCast(i128, @as(u128, 0xaaaaaaaa_aaaaaaaa_aaaaaaaa_aaaaaaaa)));
+}
+
+fn testBinaryNot128(comptime Type: type, x: Type) !void {
+    try expect(~x == @as(Type, 0x55555555_55555555_55555555_55555555));
+}
+
 test "division" {
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
@@ -540,7 +560,6 @@ fn testUnsignedNegationWrappingEval(x: u16) !void {
 test "negation wrapping" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
 
     try expectEqual(@as(u1, 1), negateWrap(u1, 1));
 }
@@ -632,10 +651,24 @@ test "128-bit multiplication" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
-    var a: i128 = 3;
-    var b: i128 = 2;
-    var c = a * b;
-    try expect(c == 6);
+    {
+        var a: i128 = 3;
+        var b: i128 = 2;
+        var c = a * b;
+        try expect(c == 6);
+
+        a = -3;
+        b = 2;
+        c = a * b;
+        try expect(c == -6);
+    }
+
+    {
+        var a: u128 = 0xffffffffffffffff;
+        var b: u128 = 100;
+        var c = a * b;
+        try expect(c == 0x63ffffffffffffff9c);
+    }
 }
 
 test "@addWithOverflow" {
@@ -1185,7 +1218,7 @@ test "quad hex float literal parsing accurate" {
                 0xb6a0000000000000,
             };
 
-            for (exp2ft) |x, i| {
+            for (exp2ft, 0..) |x, i| {
                 try expect(@bitCast(u64, x) == answers[i]);
             }
         }
@@ -1296,7 +1329,6 @@ test "float remainder division using @rem" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_llvm and builtin.os.tag == .windows) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/12602
 
     comptime try frem(f16);
     comptime try frem(f32);
@@ -1339,7 +1371,6 @@ test "float modulo division using @mod" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_llvm and builtin.os.tag == .windows) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/12602
 
     comptime try fmod(f16);
     comptime try fmod(f32);
@@ -1402,7 +1433,6 @@ test "@round f80" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_llvm and builtin.os.tag == .windows) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/12602
 
     try testRound(f80, 12.0);
     comptime try testRound(f80, 12.0);
@@ -1430,7 +1460,6 @@ test "vector integer addition" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const S = struct {
@@ -1494,7 +1523,6 @@ fn testNanEqNan(comptime F: type) !void {
 }
 
 test "vector comparison" {
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
@@ -1530,6 +1558,12 @@ test "signed zeros are represented properly" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+
+    if (builtin.os.tag == .windows and builtin.cpu.arch == .aarch64 and
+        builtin.zig_backend == .stage2_c)
+    {
+        return error.SkipZigTest;
+    }
 
     const S = struct {
         fn doTheTest() !void {

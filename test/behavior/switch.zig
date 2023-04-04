@@ -228,7 +228,6 @@ const SwitchProngWithVarEnum = union(enum) {
 };
 
 test "switch prong with variable" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -403,7 +402,6 @@ fn return_a_number() anyerror!i32 {
 }
 
 test "switch on integer with else capturing expr" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
     const S = struct {
@@ -421,7 +419,6 @@ test "switch on integer with else capturing expr" {
 }
 
 test "else prong of switch on error set excludes other cases" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -511,7 +508,6 @@ test "return result loc and then switch with range implicit casted to error unio
 }
 
 test "switch with null and T peer types and inferred result location type" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -577,7 +573,6 @@ test "switch prongs with cases with identical payload types" {
 }
 
 test "switch on pointer type" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -624,7 +619,6 @@ test "switch on error set with single else" {
 }
 
 test "switch capture copies its payload" {
-    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -685,4 +679,18 @@ test "enum value without tag name used as switch item" {
         .b => return error.TestFailed,
         _ => return error.TestFailed,
     }
+}
+
+test "switch item sizeof" {
+    const S = struct {
+        fn doTheTest() !void {
+            var a: usize = 0;
+            switch (a) {
+                @sizeOf(struct {}) => {},
+                else => return error.TestFailed,
+            }
+        }
+    };
+    try S.doTheTest();
+    comptime try S.doTheTest();
 }
