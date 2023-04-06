@@ -365,6 +365,7 @@ const usage_build_generic =
     \\
     \\General Options:
     \\  -h, --help                Print this help and exit
+    \\  -u --allow-unused         Allow unused variables
     \\  --color [auto|off|on]     Enable or disable colored error messages
     \\  -femit-bin[=path]         (default) Output machine code
     \\  -fno-emit-bin             Do not output machine code
@@ -709,6 +710,7 @@ fn buildOutputType(
     all_args: []const []const u8,
     arg_mode: ArgMode,
 ) !void {
+    var allow_unused = false;
     var color: Color = .auto;
     var optimize_mode: std.builtin.Mode = .Debug;
     var provided_name: ?[]const u8 = null;
@@ -961,6 +963,8 @@ fn buildOutputType(
                     if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
                         try io.getStdOut().writeAll(usage_build_generic);
                         return cleanExit();
+                    } else if (mem.eql(u8, arg, "-u") or mem.eql(u8, arg, "--allow-unused")) {
+                        allow_unused = true;
                     } else if (mem.eql(u8, arg, "--")) {
                         if (arg_mode == .run) {
                             // args_iter.i is 1, referring the next arg after "--" in ["--", ...]
@@ -3013,6 +3017,7 @@ fn buildOutputType(
     gimmeMoreOfThoseSweetSweetFileDescriptors();
 
     const comp = Compilation.create(gpa, .{
+        .allow_unused = allow_unused,
         .zig_lib_directory = zig_lib_directory,
         .local_cache_directory = local_cache_directory,
         .global_cache_directory = global_cache_directory,
@@ -4192,6 +4197,7 @@ pub const usage_build =
     \\   --global-cache-dir [path]     Override path to global Zig cache directory
     \\   --zig-lib-dir [arg]           Override path to Zig lib directory
     \\   --build-runner [file]         Override path to build runner
+    \\   -u --allow-unused             Allow unused variables
     \\   -h, --help                    Print this help and exit
     \\
 ;
@@ -4212,6 +4218,7 @@ pub fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !voi
         var child_argv = std.ArrayList([]const u8).init(arena);
         var reference_trace: ?u32 = null;
         var debug_compile_errors = false;
+        var allow_unused = false;
 
         const argv_index_exe = child_argv.items.len;
         _ = try child_argv.addOne();
@@ -4273,6 +4280,8 @@ pub fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !voi
                     } else if (mem.eql(u8, arg, "--debug-compile-errors")) {
                         try child_argv.append(arg);
                         debug_compile_errors = true;
+                    } else if (mem.eql(u8, arg, "--allow-unused") or mem.eql(u8, arg, "-u")) {
+                        allow_unused = true;
                     }
                 }
                 try child_argv.append(arg);
@@ -4470,6 +4479,7 @@ pub fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !voi
         try main_pkg.add(gpa, "@build", &build_pkg);
 
         const comp = Compilation.create(gpa, .{
+            .allow_unused = allow_unused,
             .zig_lib_directory = zig_lib_directory,
             .local_cache_directory = local_cache_directory,
             .global_cache_directory = global_cache_directory,
@@ -4594,6 +4604,7 @@ pub const usage_fmt =
     \\
     \\Options:
     \\   -h, --help             Print this help and exit
+    \\   -u  --allow-unused     Allow unused variables
     \\   --color [auto|off|on]  Enable or disable colored error messages
     \\   --stdin                Format code from stdin; output to stdout
     \\   --check                List non-conforming files and exit with an error
@@ -4605,6 +4616,7 @@ pub const usage_fmt =
 ;
 
 const Fmt = struct {
+    allow_unused: bool,
     seen: SeenMap,
     any_error: bool,
     check_ast: bool,
@@ -4621,6 +4633,7 @@ pub fn cmdFmt(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
     var stdin_flag: bool = false;
     var check_flag: bool = false;
     var check_ast_flag: bool = false;
+    var allow_unused: bool = false;
     var input_files = ArrayList([]const u8).init(gpa);
     defer input_files.deinit();
     var excluded_files = ArrayList([]const u8).init(gpa);
@@ -4635,7 +4648,10 @@ pub fn cmdFmt(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
                     const stdout = io.getStdOut().writer();
                     try stdout.writeAll(usage_fmt);
                     return cleanExit();
-                } else if (mem.eql(u8, arg, "--color")) {
+                } else if (mem.eql(u8, arg, "--allow-unused") or mem.eql(u8, arg, "-u")) {
+                    allow_unused = true;
+                }
+                else if (mem.eql(u8, arg, "--color")) {
                     if (i + 1 >= args.len) {
                         fatal("expected [auto|on|off] after --color", .{});
                     }
@@ -4700,7 +4716,7 @@ pub fn cmdFmt(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
             file.pkg = try Package.create(gpa, null, file.sub_file_path);
             defer file.pkg.destroy(gpa);
 
-            file.zir = try AstGen.generate(gpa, file.tree);
+            file.zir = try AstGen.generate(gpa, file.tree, allow_unused);
             file.zir_loaded = true;
             defer file.zir.deinit(gpa);
 
@@ -4715,7 +4731,7 @@ pub fn cmdFmt(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
                 process.exit(2);
             }
         } else if (tree.errors.len != 0) {
-            try printAstErrorsToStderr(gpa, tree, "<stdin>", color);
+            try printAstErrorsToStderr(gpa, tree, "<stdin>", color, allow_unused);
             process.exit(2);
         }
         const formatted = try tree.render(gpa);
@@ -4734,6 +4750,7 @@ pub fn cmdFmt(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
     }
 
     var fmt = Fmt{
+        .allow_unused = allow_unused,
         .gpa = gpa,
         .arena = arena,
         .seen = Fmt.SeenMap.init(gpa),
@@ -4811,8 +4828,7 @@ fn fmtPathDir(
     file_path: []const u8,
     check_mode: bool,
     parent_dir: fs.Dir,
-    parent_sub_path: []const u8,
-) FmtError!void {
+    parent_sub_path: []const u8) FmtError!void {
     var iterable_dir = try parent_dir.openIterableDir(parent_sub_path, .{});
     defer iterable_dir.close();
 
@@ -4847,8 +4863,7 @@ fn fmtPathFile(
     file_path: []const u8,
     check_mode: bool,
     dir: fs.Dir,
-    sub_path: []const u8,
-) FmtError!void {
+    sub_path: []const u8) FmtError!void {
     const source_file = try dir.openFile(sub_path, .{});
     var file_closed = false;
     errdefer if (!file_closed) source_file.close();
@@ -4876,7 +4891,7 @@ fn fmtPathFile(
     defer tree.deinit(gpa);
 
     if (tree.errors.len != 0) {
-        try printAstErrorsToStderr(gpa, tree, file_path, fmt.color);
+        try printAstErrorsToStderr(gpa, tree, file_path, fmt.color, fmt.allow_unused);
         fmt.any_error = true;
         return;
     }
@@ -4906,7 +4921,7 @@ fn fmtPathFile(
         if (stat.size > max_src_size)
             return error.FileTooBig;
 
-        file.zir = try AstGen.generate(gpa, file.tree);
+        file.zir = try AstGen.generate(gpa, file.tree, fmt.allow_unused);
         file.zir_loaded = true;
         defer file.zir.deinit(gpa);
 
@@ -4945,12 +4960,12 @@ fn fmtPathFile(
     }
 }
 
-fn printAstErrorsToStderr(gpa: Allocator, tree: Ast, path: []const u8, color: Color) !void {
+fn printAstErrorsToStderr(gpa: Allocator, tree: Ast, path: []const u8, color: Color, allow_unused: bool) !void {
     var wip_errors: std.zig.ErrorBundle.Wip = undefined;
     try wip_errors.init(gpa);
     defer wip_errors.deinit();
 
-    try putAstErrorsIntoBundle(gpa, tree, path, &wip_errors);
+    try putAstErrorsIntoBundle(gpa, tree, path, &wip_errors, allow_unused);
 
     var error_bundle = try wip_errors.toOwnedBundle("");
     defer error_bundle.deinit(gpa);
@@ -4962,6 +4977,7 @@ pub fn putAstErrorsIntoBundle(
     tree: Ast,
     path: []const u8,
     wip_errors: *std.zig.ErrorBundle.Wip,
+    allow_unused: bool
 ) !void {
     var file: Module.File = .{
         .status = .never_loaded,
@@ -4984,7 +5000,7 @@ pub fn putAstErrorsIntoBundle(
     file.pkg = try Package.create(gpa, null, path);
     defer file.pkg.destroy(gpa);
 
-    file.zir = try AstGen.generate(gpa, file.tree);
+    file.zir = try AstGen.generate(gpa, file.tree, allow_unused);
     file.zir_loaded = true;
     defer file.zir.deinit(gpa);
 
@@ -5448,9 +5464,10 @@ const usage_ast_check =
     \\
     \\Options:
     \\  -h, --help            Print this help and exit
+    \\  -u --allow-unused     Allow unused variables
     \\  --color [auto|off|on] Enable or disable colored error messages
     \\  -t                    (debug option) Output ZIR in text form to stdout
-    \\
+    \\ 
     \\
 ;
 
@@ -5461,6 +5478,7 @@ pub fn cmdAstCheck(
 ) !void {
     const Zir = @import("Zir.zig");
 
+    var allow_unused = false;
     var color: Color = .auto;
     var want_output_text = false;
     var zig_source_file: ?[]const u8 = null;
@@ -5483,7 +5501,10 @@ pub fn cmdAstCheck(
                 color = std.meta.stringToEnum(Color, next_arg) orelse {
                     fatal("expected [auto|on|off] after --color, found '{s}'", .{next_arg});
                 };
-            } else {
+           } else if (mem.eql(u8, arg, "--allow-unused") or mem.eql(u8, arg, "-u")) {
+                allow_unused = true;
+           }
+           else {
                 fatal("unrecognized parameter: '{s}'", .{arg});
             }
         } else if (zig_source_file == null) {
@@ -5548,7 +5569,7 @@ pub fn cmdAstCheck(
     file.tree_loaded = true;
     defer file.tree.deinit(gpa);
 
-    file.zir = try AstGen.generate(gpa, file.tree);
+    file.zir = try AstGen.generate(gpa, file.tree, allow_unused);
     file.zir_loaded = true;
     defer file.zir.deinit(gpa);
 

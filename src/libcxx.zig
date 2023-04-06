@@ -216,6 +216,7 @@ pub fn buildLibCXX(comp: *Compilation, prog_node: *std.Progress.Node) !void {
     }
 
     const sub_compilation = try Compilation.create(comp.gpa, .{
+        .allow_unused = comp.allow_unused,
         .local_cache_directory = comp.global_cache_directory,
         .global_cache_directory = comp.global_cache_directory,
         .zig_lib_directory = comp.zig_lib_directory,
@@ -377,6 +378,7 @@ pub fn buildLibCXXABI(comp: *Compilation, prog_node: *std.Progress.Node) !void {
     }
 
     const sub_compilation = try Compilation.create(comp.gpa, .{
+        .allow_unused = comp.allow_unused,
         .local_cache_directory = comp.global_cache_directory,
         .global_cache_directory = comp.global_cache_directory,
         .zig_lib_directory = comp.zig_lib_directory,

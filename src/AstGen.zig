@@ -18,6 +18,9 @@ const indexToRef = Zir.indexToRef;
 const trace = @import("tracy.zig").trace;
 const BuiltinFn = @import("BuiltinFn.zig");
 
+/// Allow unused variables
+allow_unused: bool,
+
 gpa: Allocator,
 tree: *const Ast,
 instructions: std.MultiArrayList(Zir.Inst) = .{},
@@ -110,7 +113,7 @@ fn appendRefsAssumeCapacity(astgen: *AstGen, refs: []const Zir.Inst.Ref) void {
     astgen.extra.appendSliceAssumeCapacity(coerced);
 }
 
-pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
+pub fn generate(gpa: Allocator, tree: Ast, allow_unused: bool) Allocator.Error!Zir {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
@@ -118,6 +121,7 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
         .gpa = gpa,
         .arena = arena.allocator(),
         .tree = &tree,
+        .allow_unused = allow_unused
     };
     defer astgen.deinit(gpa);
 
@@ -2806,32 +2810,36 @@ fn genDefers(
     }
 }
 
-fn checkUsed(_: *GenZir, outer_scope: *Scope, inner_scope: *Scope) InnerError!void {
-    // const astgen = gz.astgen;
+fn checkUsed(gz: *GenZir, outer_scope: *Scope, inner_scope: *Scope) InnerError!void {
+    const astgen = gz.astgen;
+    if (astgen.allow_unused) {
+        return;
+    }
+    
     var scope = inner_scope;
     while (scope != outer_scope) {
         switch (scope.tag) {
             .gen_zir => scope = scope.cast(GenZir).?.parent,
             .local_val => {
                 const s = scope.cast(Scope.LocalVal).?;
-                // if (s.used == 0 and s.discarded == 0) {
-                //     try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
-                // } else if (s.used != 0 and s.discarded != 0) {
-                //     try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
-                //         try gz.astgen.errNoteTok(s.used, "used here", .{}),
-                //     });
-                // }
+                if (s.used == 0 and s.discarded == 0) {
+                    try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
+                } else if (s.used != 0 and s.discarded != 0) {
+                    try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
+                        try gz.astgen.errNoteTok(s.used, "used here", .{}),
+                    });
+                }
                 scope = s.parent;
             },
             .local_ptr => {
                 const s = scope.cast(Scope.LocalPtr).?;
-                // if (s.used == 0 and s.discarded == 0) {
-                //     try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
-                // } else if (s.used != 0 and s.discarded != 0) {
-                //     try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
-                //         try gz.astgen.errNoteTok(s.used, "used here", .{}),
-                //     });
-                // }
+                if (s.used == 0 and s.discarded == 0) {
+                    try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
+                } else if (s.used != 0 and s.discarded != 0) {
+                    try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
+                        try gz.astgen.errNoteTok(s.used, "used here", .{}),
+                    });
+                }
                 scope = s.parent;
             },
             .defer_normal, .defer_error => scope = scope.cast(Scope.Defer).?.parent,

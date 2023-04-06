@@ -38,6 +38,9 @@ const Zir = @import("Zir.zig");
 const Autodoc = @import("Autodoc.zig");
 const Color = @import("main.zig").Color;
 
+/// Allow unused variables
+allow_unused: bool,
+
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: Allocator,
 /// Arena-allocated memory used during initialization. Should be untouched until deinit.
@@ -453,6 +456,9 @@ pub const LinkObject = struct {
 };
 
 pub const InitOptions = struct {
+    /// allow unused variables
+    allow_unused: bool, 
+
     zig_lib_directory: Directory,
     local_cache_directory: Directory,
     global_cache_directory: Directory,
@@ -736,6 +742,8 @@ pub fn create(gpa: Allocator, options: InitOptions) !*Compilation {
         // We put the `Compilation` itself in the arena. Freeing the arena will free the module.
         // It's initialized later after we prepare the initialization options.
         const comp = try arena.create(Compilation);
+        comp.allow_unused = options.allow_unused;
+        
         const root_name = try arena.dupeZ(u8, options.root_name);
 
         // Make a decision on whether to use LLVM or our own backend.
@@ -1530,6 +1538,7 @@ pub fn create(gpa: Allocator, options: InitOptions) !*Compilation {
         });
         errdefer bin_file.destroy();
         comp.* = .{
+            .allow_unused = options.allow_unused,
             .gpa = gpa,
             .arena_state = arena_allocator.state,
             .zig_lib_directory = options.zig_lib_directory,
@@ -5313,6 +5322,7 @@ fn buildOutputFromZig(
         .basename = bin_basename,
     };
     const sub_compilation = try Compilation.create(comp.gpa, .{
+        .allow_unused = comp.allow_unused,
         .global_cache_directory = comp.global_cache_directory,
         .local_cache_directory = comp.global_cache_directory,
         .zig_lib_directory = comp.zig_lib_directory,
@@ -5386,6 +5396,7 @@ pub fn build_crt_file(
     errdefer comp.gpa.free(basename);
 
     const sub_compilation = try Compilation.create(comp.gpa, .{
+        .allow_unused = comp.allow_unused,
         .local_cache_directory = comp.global_cache_directory,
         .global_cache_directory = comp.global_cache_directory,
         .zig_lib_directory = comp.zig_lib_directory,

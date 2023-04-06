@@ -250,7 +250,7 @@ pub fn fetchAndAddDependencies(
 
     if (ast.errors.len > 0) {
         const file_path = try directory.join(arena, &.{Manifest.basename});
-        try main.putAstErrorsIntoBundle(gpa, ast, file_path, error_bundle);
+        try main.putAstErrorsIntoBundle(gpa, ast, file_path, error_bundle, true);
         return error.PackageFetchFailed;
     }
 

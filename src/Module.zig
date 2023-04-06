@@ -3759,7 +3759,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
     file.tree_loaded = true;
 
     // Any potential AST errors are converted to ZIR errors here.
-    file.zir = try AstGen.generate(gpa, file.tree);
+    file.zir = try AstGen.generate(gpa, file.tree, comp.allow_unused);
     file.zir_loaded = true;
     file.status = .success_zir;
     log.debug("AstGen fresh success: {s}", .{file.sub_file_path});
@@ -4018,7 +4018,7 @@ pub fn populateBuiltinFile(mod: *Module) !void {
     file.tree_loaded = true;
     assert(file.tree.errors.len == 0); // builtin.zig must parse
 
-    file.zir = try AstGen.generate(gpa, file.tree);
+    file.zir = try AstGen.generate(gpa, file.tree, comp.allow_unused);
     file.zir_loaded = true;
     file.status = .success_zir;
 }

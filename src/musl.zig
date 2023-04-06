@@ -200,6 +200,7 @@ pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile, prog_node: *std.Progr
                 &[_][]const u8{arch_define};
 
             const sub_compilation = try Compilation.create(comp.gpa, .{
+                .allow_unused = comp.allow_unused,
                 .local_cache_directory = comp.global_cache_directory,
                 .global_cache_directory = comp.global_cache_directory,
                 .cache_mode = .whole,
