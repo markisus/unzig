@@ -2,7 +2,7 @@ Unzig
 =====
 Forked from ziglang:master tag: 0.10.1
 
-The sole purpose of this fork is to add a flag --allow-unused (shorthand -u) to disable Zig's unused variable compilation error.  
+The sole purpose of this fork is to add a flag --allow-unused (shorthand -u) to disable Zig's unused variable compilation error using [this patch.](https://github.com/markisus/unzig/commit/86b1435a7992bfc1197a7930ea92e93cf402663a)  
 
 The flag is available for the following commands.  
 `zig build -u ...`  
@@ -19,6 +19,7 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 make install
 ```  
+
 
 Original README reproduced below.
 
