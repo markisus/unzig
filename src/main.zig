@@ -24,6 +24,8 @@ const target_util = @import("target.zig");
 const ThreadPool = @import("ThreadPool.zig");
 const crash_report = @import("crash_report.zig");
 
+const AllowUnused = @import("AllowUnused.zig");
+
 // Crash report needs to override the panic handler and other root decls
 pub usingnamespace crash_report.root_decls;
 
@@ -870,6 +872,10 @@ fn buildOutputType(
                         fatal("unable to read response file '{s}': {s}", .{ resp_file_path, @errorName(err) });
                     };
                 } else if (mem.startsWith(u8, arg, "-")) {
+                    if (mem.eql(u8, arg, "-u") or mem.eql(u8, arg, "--allow-unused")) {
+                        AllowUnused.set(true);
+                        continue;
+                    }
                     if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
                         try io.getStdOut().writeAll(usage_build_generic);
                         return cleanExit();
@@ -3789,6 +3795,11 @@ pub fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !voi
             while (i < args.len) : (i += 1) {
                 const arg = args[i];
                 if (mem.startsWith(u8, arg, "-")) {
+                    if (mem.eql(u8, arg, "-u") or mem.eql(u8, arg, "--allow-unused")) {
+                        AllowUnused.set(true);
+                        try child_argv.append(arg);
+                        continue;
+                    }
                     if (mem.eql(u8, arg, "--build-file")) {
                         if (i + 1 >= args.len) fatal("expected argument after '{s}'", .{arg});
                         i += 1;
@@ -4104,6 +4115,11 @@ pub fn cmdFmt(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
         while (i < args.len) : (i += 1) {
             const arg = args[i];
             if (mem.startsWith(u8, arg, "-")) {
+                if (mem.eql(u8, arg, "-u") or mem.eql(u8, arg, "--allow-unused")) {
+                    AllowUnused.set(true);
+                    continue;
+                }
+
                 if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
                     const stdout = io.getStdOut().writer();
                     try stdout.writeAll(usage_fmt);

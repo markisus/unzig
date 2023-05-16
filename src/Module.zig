@@ -31,6 +31,8 @@ const target_util = @import("target.zig");
 const build_options = @import("build_options");
 const Liveness = @import("Liveness.zig");
 
+const AllowUnused = @import("AllowUnused.zig");
+
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: Allocator,
 comp: *Compilation,
@@ -3577,6 +3579,7 @@ pub fn astGenFile(mod: *Module, file: *File) !void {
             path_hash.addOptionalBytes(file.pkg.root_src_directory.path);
         }
         path_hash.addBytes(file.sub_file_path);
+        path_hash.add(AllowUnused.get());
         break :hash path_hash.final();
     };
     const cache_directory = if (want_local_cache) mod.local_zir_cache else mod.global_zir_cache;

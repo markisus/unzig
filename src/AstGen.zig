@@ -16,6 +16,8 @@ const indexToRef = Zir.indexToRef;
 const trace = @import("tracy.zig").trace;
 const BuiltinFn = @import("BuiltinFn.zig");
 
+const AllowUnused = @import("AllowUnused.zig");
+
 gpa: Allocator,
 tree: *const Ast,
 instructions: std.MultiArrayList(Zir.Inst) = .{},
@@ -2800,6 +2802,10 @@ fn genDefers(
 }
 
 fn checkUsed(gz: *GenZir, outer_scope: *Scope, inner_scope: *Scope) InnerError!void {
+    if (AllowUnused.get()) {
+        return;
+    }
+
     const astgen = gz.astgen;
 
     var scope = inner_scope;

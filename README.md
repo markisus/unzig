@@ -1,3 +1,23 @@
+Unzig
+=====
+The sole purpose of this fork is to add a flag --allow-unused (shorthand -u) to disable Zig's unused variable compilation error.  
+
+The flag is available for the following commands.
+`zig build -u ...`  
+`zig build-[exe|lib|obj] -u ...`  
+`zig fmt -u ...`   
+
+No binary releases are available (yet). It is easy to compile from source as long as you have the required build tools (cmake, clang, etc) on your local machine, with the standard method (see [build from source](https://github.com/ziglang/zig/wiki/Building-Zig-From-Source)).
+
+In short,  
+```
+mkdir build  
+cd build  
+cmake -DCMAKE_BUILD_TYPE=Release .. 
+make
+make install
+```
+
 ![ZIG](https://ziglang.org/img/zig-logo-dynamic.svg)
 
 A general-purpose programming language and toolchain for maintaining

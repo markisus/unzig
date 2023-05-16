@@ -80,7 +80,10 @@ pub fn main() !void {
                     return usageAndErr(builder, false, stderr_stream);
             }
         } else if (mem.startsWith(u8, arg, "-")) {
-            if (mem.eql(u8, arg, "--verbose")) {
+            if (mem.eql(u8, arg, "-u") or mem.eql(u8, arg, "--allow-unused")) {
+                builder.allow_unused = true;
+            }
+            else if (mem.eql(u8, arg, "--verbose")) {
                 builder.verbose = true;
             } else if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
                 return usage(builder, false, stdout_stream);
