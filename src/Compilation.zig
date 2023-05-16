@@ -40,6 +40,8 @@ const Zir = @import("Zir.zig");
 const Autodoc = @import("Autodoc.zig");
 const Color = @import("main.zig").Color;
 
+const AllowUnused = @import("AllowUnused.zig");
+
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: Allocator,
 /// Arena-allocated memory used during initialization. Should be untouched until deinit.
@@ -1469,6 +1471,7 @@ pub fn create(gpa: Allocator, options: InitOptions) !*Compilation {
         errdefer cache.manifest_dir.close();
 
         // This is shared hasher state common to zig source and all C source files.
+        cache.hash.add(AllowUnused.get());
         cache.hash.addBytes(build_options.version);
         cache.hash.add(builtin.zig_backend);
         cache.hash.addBytes(options.zig_lib_directory.path orelse ".");
@@ -1533,6 +1536,7 @@ pub fn create(gpa: Allocator, options: InitOptions) !*Compilation {
             }
 
             // Synchronize with other matching comments: ZigOnlyHashStuff
+            hash.add(AllowUnused.get());
             hash.add(valgrind);
             hash.add(single_threaded);
             hash.add(use_stage1);
@@ -2255,6 +2259,8 @@ pub fn update(comp: *Compilation) !void {
         comp.bin_file.releaseLock();
 
         man = comp.cache_parent.obtain();
+        man.hash.add(AllowUnused.get());
+        
         comp.whole_cache_manifest = &man;
         try comp.addNonIncrementalStuffToCacheManifest(&man);
 
@@ -2592,6 +2598,7 @@ fn addNonIncrementalStuffToCacheManifest(comp: *Compilation, man: *Cache.Manifes
         }
 
         // Synchronize with other matching comments: ZigOnlyHashStuff
+        man.hash.add(AllowUnused.get());
         man.hash.add(comp.bin_file.options.valgrind);
         man.hash.add(comp.bin_file.options.single_threaded);
         man.hash.add(comp.bin_file.options.use_stage1);

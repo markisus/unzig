@@ -29,6 +29,7 @@ pub const OptionsStep = @import("build/OptionsStep.zig");
 pub const EmulatableRunStep = @import("build/EmulatableRunStep.zig");
 
 pub const Builder = struct {
+    allow_unused : bool = false,
     install_tls: TopLevelStep,
     uninstall_tls: TopLevelStep,
     allocator: Allocator,
@@ -2450,6 +2451,10 @@ pub const LibExeObjStep = struct {
             .test_exe => "test",
         };
         zig_args.append(cmd) catch unreachable;
+
+        if (builder.allow_unused) {
+            try zig_args.append("--allow-unused");
+        }
 
         if (builder.color != .auto) {
             try zig_args.append("--color");
